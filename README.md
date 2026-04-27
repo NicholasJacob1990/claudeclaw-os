@@ -98,6 +98,26 @@ npm run aggregate-suggestions [-- --dry-run] [-- --json]
 
 See: [docs/learning-loop-aggregator.md](docs/learning-loop-aggregator.md)
 
+### S6: Skill Dashboard
+Local HTTP dashboard (port 7777) for monitoring skills, suggestions, and annotations. Dark-themed, server-side rendered HTML. Reads from the same SQLite DBs as S5/S2/S4.
+
+```bash
+npm run skill-dashboard
+# open http://localhost:7777
+```
+
+See: [docs/skill-dashboard.md](docs/skill-dashboard.md)
+
+### S7: Skill Health
+Validates every `SKILL.md` in `~/.claude/skills/` — 13 structural checks + 7 quality checks. Exits 1 if any errors found.
+
+```bash
+npm run skill-health
+npm run skill-health -- --dir /path/to/skills --strict
+```
+
+See: [docs/skill-health.md](docs/skill-health.md)
+
 ---
 
 ## Get Started
@@ -1371,6 +1391,8 @@ npm run typecheck                  # Type-check without compiling
 npm run import-hermes-skills       # Import skills from NousResearch/hermes-agent into ~/.claude/skills/
 npm run import-hermes-skills -- --dry-run    # Preview what would change without writing files
 npm run import-hermes-skills -- --no-cleanup # Keep temp clone dir after import (debugging)
+npm run skill-dashboard            # Start skill dashboard at http://localhost:7777 (S6)
+npm run skill-health               # Run SKILL.md health checks and print report (S7)
 ```
 
 ---
