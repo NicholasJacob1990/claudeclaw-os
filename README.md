@@ -1330,13 +1330,16 @@ Browse more: [github.com/anthropics/claude-code](https://github.com/anthropics/c
 ## Available scripts
 
 ```bash
-npm run setup     # Interactive setup wizard
-npm run status    # Health check. env, bot, DB, service
-npm run build     # Compile TypeScript → dist/
-npm start         # Run compiled bot (production)
-npm run dev       # Run with tsx, no build needed (development)
-npm test          # Run test suite (vitest)
-npm run typecheck # Type-check without compiling
+npm run setup                      # Interactive setup wizard
+npm run status                     # Health check. env, bot, DB, service
+npm run build                      # Compile TypeScript → dist/
+npm start                          # Run compiled bot (production)
+npm run dev                        # Run with tsx, no build needed (development)
+npm test                           # Run test suite (vitest)
+npm run typecheck                  # Type-check without compiling
+npm run import-hermes-skills       # Import skills from NousResearch/hermes-agent into ~/.claude/skills/
+npm run import-hermes-skills -- --dry-run    # Preview what would change without writing files
+npm run import-hermes-skills -- --no-cleanup # Keep temp clone dir after import (debugging)
 ```
 
 ---
