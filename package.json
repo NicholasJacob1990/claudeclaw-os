@@ -19,7 +19,9 @@
     "agent:start": "node dist/index.js --agent",
     "uninstall": "bash scripts/uninstall.sh",
     "build:warroom-client": "esbuild warroom/client.js --bundle --outfile=warroom/client.bundle.js --format=iife --global-name=PipecatWarRoom",
-    "import-hermes-skills": "tsx scripts/import-hermes-skills.ts"
+    "import-hermes-skills": "tsx scripts/import-hermes-skills.ts",
+    "annotate-skills": "tsx scripts/annotate-skills.ts",
+    "aggregate-suggestions": "tsx scripts/aggregate-suggestions.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.34",

@@ -66,6 +66,37 @@ These are powerful but require extra API keys or services. Each one has its own 
 | **War Room** | `GOOGLE_API_KEY` + Python venv | Live voice boardroom with your agent team via Gemini Live |
 | **WhatsApp bridge** | Puppeteer + QR scan | Highly experimental. Read/send WhatsApp from Telegram |
 | **Skill suggestion** | (none — built-in) | Auto-detects complex sessions and proposes a SKILL.md draft via Sonnet |
+| **Skill annotations** | (none — built-in) | Detects correction signals in transcripts and appends notes to skill files via Haiku judge |
+| **Learning loop aggregator** | (none — built-in) | Clusters recurring patterns across sessions; emits consolidated skill suggestions when threshold reached |
+
+---
+
+## Skill Learning Systems
+
+ClaudeClaw includes three interconnected systems that learn from your Claude Code sessions:
+
+### S5: Single-session Skill Suggestion
+Runs at Stop hook time. Detects session complexity (tool calls, files edited, tool types) and writes a draft skill suggestion to `~/.claude/skills/auto-suggested/_pending/`. Optionally enriches the draft with Sonnet via OAuth subscription.
+
+See: [docs/skill-suggestion.md](docs/skill-suggestion.md)
+
+### S4: Skill Annotations
+Detects correction signals in transcripts (user messages after a Skill invocation that indicate the output was wrong). Uses a cheap keyword gate + Haiku judge to avoid false positives. Appends dated notes to the relevant `SKILL.md` file.
+
+```bash
+npm run annotate-skills -- /path/to/transcript.jsonl [session_id] [--dry-run]
+```
+
+See: [docs/skill-annotations.md](docs/skill-annotations.md)
+
+### S2: Learning Loop Aggregator
+Scans accumulated pending suggestions across multiple sessions, clusters them by Jaccard similarity on tool-sequence patterns, and emits consolidated suggestions when a cluster reaches threshold (default: 3 sessions).
+
+```bash
+npm run aggregate-suggestions [-- --dry-run] [-- --json]
+```
+
+See: [docs/learning-loop-aggregator.md](docs/learning-loop-aggregator.md)
 
 ---
 
