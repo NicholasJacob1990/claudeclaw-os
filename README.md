@@ -65,6 +65,7 @@ These are powerful but require extra API keys or services. Each one has its own 
 | **Memory consolidation** | `GOOGLE_API_KEY` | Gemini detects patterns across conversations |
 | **War Room** | `GOOGLE_API_KEY` + Python venv | Live voice boardroom with your agent team via Gemini Live |
 | **WhatsApp bridge** | Puppeteer + QR scan | Highly experimental. Read/send WhatsApp from Telegram |
+| **Skill suggestion** | (none — built-in) | Auto-detects complex sessions and proposes a SKILL.md draft via Sonnet |
 
 ---
 
