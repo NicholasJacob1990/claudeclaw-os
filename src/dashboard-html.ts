@@ -200,7 +200,7 @@ const WARROOM_ENABLED = warroomEnabled;
       <div class="model-picker" onclick="toggleModelPicker(this)" style="display:inline-block">
         <span class="model-current" style="color:#6b7280">Set all <span style="font-size:8px;opacity:0.5">&#9662;</span></span>
         <div class="model-menu" style="display:none;right:0;left:auto">
-          <div class="model-opt" data-model="claude-opus-4-6" onclick="pickGlobalModel(this)">All Opus</div>
+          <div class="model-opt" data-model="claude-opus-4-7" onclick="pickGlobalModel(this)">All Opus</div>
           <div class="model-opt" data-model="claude-sonnet-4-6" onclick="pickGlobalModel(this)">All Sonnet</div>
           <div class="model-opt" data-model="claude-haiku-4-5" onclick="pickGlobalModel(this)">All Haiku</div>
         </div>
@@ -217,6 +217,50 @@ ${WARROOM_ENABLED ? `<div class="card" style="display:flex;align-items:center;ju
     <div style="font-size:12px;color:#6b7280;margin-top:2px">Voice standup with your agent team</div>
   </div>
   <div style="font-size:20px;color:#3b82f6">&#127908;</div>
+</div>` : ''}
+
+<!-- War Room Audio Stack (provider + language pin) -->
+${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
+  <div style="margin-bottom:10px">
+    <div style="font-size:14px;font-weight:600;color:#a5b4fc">War Room Audio Stack</div>
+    <div style="font-size:11px;color:#6b7280;margin-top:2px">Voice provider + output language. Saved to /tmp pins; subprocess respawns to apply.</div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div>
+      <label style="font-size:11px;color:#9ca3af;display:block;margin-bottom:4px">Voice Provider</label>
+      <select id="dash-provider-select" onchange="dashSetProvider(this.value)" style="width:100%;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:6px;padding:6px 10px;color:#e0e0e0;font-size:12px;outline:none;cursor:pointer">
+        <option value="">Default (env)</option>
+        <option value="gemini-live">Gemini 3.1 Flash Live (E2E)</option>
+        <option value="gemini-live-25">Gemini 2.5 Native (lower latency)</option>
+        <option value="xai">xAI Grok Voice (Ara/Eve/Leo/Rex/Sal)</option>
+        <option value="groq">Groq (Whisper + Claude + PlayAI)</option>
+        <option value="cartesia">Cartesia legacy (Deepgram + Claude)</option>
+        <option value="elevenlabs">ElevenLabs (Whisper STT + Claude + ElevenLabs TTS)</option>
+        <option value="voxtral">Voxtral / Mistral (realtime STT + Claude + Voxtral TTS)</option>
+      </select>
+      <span id="dash-provider-status" style="font-size:10px;color:#6b7280;margin-top:4px;display:block">loading...</span>
+    </div>
+    <div>
+      <label style="font-size:11px;color:#9ca3af;display:block;margin-bottom:4px">Output Language</label>
+      <select id="dash-lang-select" onchange="dashSetLanguage(this.value)" style="width:100%;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:6px;padding:6px 10px;color:#e0e0e0;font-size:12px;outline:none;cursor:pointer">
+        <option value="auto">Auto (multilingual / code-switch)</option>
+        <option value="">Off (Gemini default)</option>
+        <option value="pt-BR">Portugu&ecirc;s (Brasil)</option>
+        <option value="pt-PT">Portugu&ecirc;s (Portugal)</option>
+        <option value="en-US">English (US)</option>
+        <option value="en-GB">English (UK)</option>
+        <option value="es-ES">Espa&ntilde;ol</option>
+        <option value="es-MX">Espa&ntilde;ol (M&eacute;xico)</option>
+        <option value="fr-FR">Fran&ccedil;ais</option>
+        <option value="de-DE">Deutsch</option>
+        <option value="it-IT">Italiano</option>
+        <option value="ja-JP">&#26085;&#26412;&#35486;</option>
+        <option value="zh-CN">&#20013;&#25991;</option>
+        <option value="ar-SA">&#1575;&#1604;&#1593;&#1585;&#1576;&#1610;&#1577;</option>
+      </select>
+      <span id="dash-lang-status" style="font-size:10px;color:#6b7280;margin-top:4px;display:block">loading...</span>
+    </div>
+  </div>
 </div>` : ''}
 
 <!-- War Room Voice Settings (only shown when WARROOM_ENABLED) -->
@@ -394,7 +438,7 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
           <label class="text-xs text-gray-400 block mb-1">Model</label>
           <select id="caw-model" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none">
             <option value="claude-sonnet-4-6" selected>Sonnet 4.6</option>
-            <option value="claude-opus-4-6">Opus 4.6</option>
+            <option value="claude-opus-4-7">Opus 4.7</option>
             <option value="claude-haiku-4-5">Haiku 4.5</option>
           </select>
         </div>
@@ -1044,6 +1088,59 @@ document.addEventListener('click', function(e) {
   document.querySelectorAll('.info-tip.active').forEach(t => t.classList.remove('active'));
 }, true);
 
+// ── War Room audio stack (provider + language pins) ──────────────────
+// Same /tmp pin files used by the warroom HTML, but exposed in Mission
+// Control so users don't need to enter the war room to switch stacks.
+function apiPost(path, body) {
+  const sep = path.includes('?') ? '&' : '?';
+  return fetch(BASE + path + sep + 'token=' + TOKEN, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(r => r.json());
+}
+
+async function dashSetProvider(p) {
+  const status = document.getElementById('dash-provider-status');
+  if (status) status.textContent = 'saving...';
+  try {
+    const j = await apiPost('/api/warroom/provider', { provider: p || null, restart: true });
+    if (j && j.ok) {
+      if (status) status.textContent = p ? ('using ' + p + ' (subprocess restarted)') : 'env default';
+    } else if (status) {
+      status.textContent = 'error: ' + (j && j.error || 'unknown');
+    }
+  } catch (e) { if (status) status.textContent = 'error: ' + e.message; }
+}
+
+async function dashSetLanguage(code) {
+  const status = document.getElementById('dash-lang-status');
+  if (status) status.textContent = 'saving...';
+  try {
+    const j = await apiPost('/api/warroom/language', { language: code || null, restart: true });
+    if (j && j.ok) {
+      if (status) status.textContent = code ? ('locked to ' + code) : 'auto-detect';
+    } else if (status) {
+      status.textContent = 'error: ' + (j && j.error || 'unknown');
+    }
+  } catch (e) { if (status) status.textContent = 'error: ' + e.message; }
+}
+
+(async function loadDashAudioStack(){
+  try {
+    const p = await api('/api/warroom/provider');
+    const l = await api('/api/warroom/language');
+    const ps = document.getElementById('dash-provider-select');
+    const ls = document.getElementById('dash-lang-select');
+    const psStatus = document.getElementById('dash-provider-status');
+    const lsStatus = document.getElementById('dash-lang-status');
+    if (ps) ps.value = (p && p.provider) || '';
+    if (ls) ls.value = (l && l.language) || '';
+    if (psStatus) psStatus.textContent = (p && p.provider) ? ('using ' + p.provider) : 'env default';
+    if (lsStatus) lsStatus.textContent = (l && l.language) ? ('locked to ' + l.language) : 'auto-detect';
+  } catch(e){}
+})();
+
 // ── War Room voice config ────────────────────────────────────────────
 // State lives on window so the edit tracking survives refreshAgents() cycles.
 window.__voicesState = { loaded: false, rows: [], catalog: [], dirty: new Set() };
@@ -1056,6 +1153,7 @@ async function loadVoices() {
     if (!data || !data.ok) throw new Error((data && data.error) || 'failed');
     window.__voicesState.rows = data.voices;
     window.__voicesState.catalog = data.gemini_catalog;
+    window.__voicesState.xaiCatalog = data.xai_catalog || [];
     window.__voicesState.dirty = new Set();
     window.__voicesState.loaded = true;
     renderVoices();
@@ -1068,9 +1166,14 @@ function renderVoices() {
   const rowsEl = document.getElementById('voicesRows');
   if (!rowsEl) return;
   const { rows, catalog, dirty } = window.__voicesState;
+  const xaiCatalog = window.__voicesState.xaiCatalog || [];
   const html = rows.map(function(r) {
-    const opts = catalog.map(function(v) {
+    const geminiOpts = catalog.map(function(v) {
       const selected = v.name === r.gemini_voice ? ' selected' : '';
+      return '<option value="' + v.name + '"' + selected + '>' + v.name + ' (' + v.style + ')</option>';
+    }).join('');
+    const xaiOpts = xaiCatalog.map(function(v) {
+      const selected = v.name === r.xai_voice ? ' selected' : '';
       return '<option value="' + v.name + '"' + selected + '>' + v.name + ' (' + v.style + ')</option>';
     }).join('');
     const isDirty = dirty.has(r.agent);
@@ -1082,10 +1185,16 @@ function renderVoices() {
       ? '<span style="font-size:9px;color:#818cf8;margin-left:6px;padding:1px 5px;border:1px solid #4f46e5;border-radius:3px;background:rgba(79,70,229,0.1)">unsaved</span>'
       : '';
     return (
-      '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(255,255,255,0.02);border:1px solid ' + borderColor + ';border-radius:6px">' +
+      '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(255,255,255,0.02);border:1px solid ' + borderColor + ';border-radius:6px;flex-wrap:wrap">' +
         '<div style="width:80px;font-size:12px;font-weight:600;color:#d1d5db;text-transform:uppercase;letter-spacing:0.5px">' + r.agent + defaultBadge + dirtyBadge + '</div>' +
-        '<select data-agent="' + r.agent + '" onchange="onVoiceChange(this)" style="flex:1;max-width:280px;background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:4px;padding:4px 8px;font-size:12px;font-family:inherit">' + opts + '</select>' +
-        '<div style="flex:1;min-width:0;font-size:10px;color:#6b7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + (r.name || '') + '</div>' +
+        '<div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:200px">' +
+          '<span style="font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Gemini</span>' +
+          '<select data-agent="' + r.agent + '" data-provider="gemini" onchange="onVoiceChange(this)" style="background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:4px;padding:4px 8px;font-size:12px;font-family:inherit">' + geminiOpts + '</select>' +
+        '</div>' +
+        '<div style="display:flex;flex-direction:column;gap:2px;flex:1;min-width:160px">' +
+          '<span style="font-size:9px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px">Grok (xAI)</span>' +
+          '<select data-agent="' + r.agent + '" data-provider="xai" onchange="onVoiceChange(this)" style="background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:4px;padding:4px 8px;font-size:12px;font-family:inherit">' + xaiOpts + '</select>' +
+        '</div>' +
       '</div>'
     );
   }).join('');
@@ -1110,11 +1219,16 @@ function renderVoices() {
 
 function onVoiceChange(sel) {
   const agent = sel.getAttribute('data-agent');
+  const provider = sel.getAttribute('data-provider') || 'gemini';
   const newVoice = sel.value;
   const row = window.__voicesState.rows.find(function(r) { return r.agent === agent; });
   if (!row) return;
-  row.gemini_voice = newVoice;
-  row.is_default = false;
+  if (provider === 'xai') {
+    row.xai_voice = newVoice;
+  } else {
+    row.gemini_voice = newVoice;
+    row.is_default = false;
+  }
   window.__voicesState.dirty.add(agent);
   renderVoices();
 }
@@ -1124,7 +1238,7 @@ async function saveVoices(applyAfter) {
   if (dirty.size === 0 && !applyAfter) return;
   const updates = rows
     .filter(function(r) { return dirty.has(r.agent) || applyAfter; })
-    .map(function(r) { return { agent: r.agent, gemini_voice: r.gemini_voice }; });
+    .map(function(r) { return { agent: r.agent, gemini_voice: r.gemini_voice, xai_voice: r.xai_voice }; });
   const statusEl = document.getElementById('voicesStatus');
   statusEl.style.color = '#6b7280';
   statusEl.textContent = 'Saving...';
@@ -1495,9 +1609,9 @@ async function loadAgents() {
       const color = AGENT_COLORS[a.id] || '#6b7280';
       const dot = a.running ? '<span style="color:#6ee7b7">\u25CF</span>' : '<span style="color:#666">\u25CB</span>';
       const statusText = a.running ? 'live' : 'off';
-      const modelOpts = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
-      const modelShort = function(m) { return {'claude-opus-4-6':'Opus','claude-sonnet-4-6':'Sonnet','claude-sonnet-4-5':'Sonnet 4.5','claude-haiku-4-5':'Haiku'}[m] || m; };
-      const currentModel = a.model || (a.id === 'main' ? 'claude-opus-4-6' : 'claude-sonnet-4-6');
+      const modelOpts = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+      const modelShort = function(m) { return {'claude-opus-4-7':'Opus','claude-sonnet-4-6':'Sonnet','claude-sonnet-4-5':'Sonnet 4.5','claude-haiku-4-5':'Haiku'}[m] || m; };
+      const currentModel = a.model || (a.id === 'main' ? 'claude-opus-4-7' : 'claude-sonnet-4-6');
       const modelLabel = modelShort(currentModel);
       const modelSelect = '<div class="model-picker" data-agent="' + a.id + '" onclick="event.stopPropagation();toggleModelPicker(this)">' +
         '<span class="model-current">' + modelLabel + ' <span style="font-size:8px;opacity:0.5">&#9662;</span></span>' +

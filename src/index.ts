@@ -183,6 +183,42 @@ async function main(): Promise<void> {
 
   const bot = createBot();
 
+  // Telegram sender that extracts [SEND_FILE:...] / [SEND_PHOTO:...] markers
+  // BEFORE relaying so mission task completions, scheduled task results, and
+  // War Room status notifications dispatch attachments via sendDocument /
+  // sendPhoto rather than dumping the literal marker text into chat.
+  async function sendToPrimary(text: string): Promise<void> {
+    if (!ALLOWED_CHAT_ID) return;
+    const { extractFileMarkers, splitMessage, formatForTelegram } = await import('./bot.js');
+    const { text: cleanText, files } = extractFileMarkers(text);
+    const { InputFile } = await import('grammy');
+
+    for (const file of files) {
+      if (!fs.existsSync(file.filePath)) {
+        await bot.api.sendMessage(ALLOWED_CHAT_ID, `(arquivo não encontrado: ${file.filePath})`).catch(() => {});
+        continue;
+      }
+      try {
+        const input = new InputFile(file.filePath);
+        if (file.type === 'photo') {
+          await bot.api.sendPhoto(ALLOWED_CHAT_ID, input, file.caption ? { caption: file.caption } : undefined);
+        } else {
+          await bot.api.sendDocument(ALLOWED_CHAT_ID, input, file.caption ? { caption: file.caption } : undefined);
+        }
+      } catch (err) {
+        logger.error({ err, filePath: file.filePath }, 'Telegram attachment send failed');
+        await bot.api.sendMessage(ALLOWED_CHAT_ID, `Falha ao enviar arquivo: ${file.filePath}`).catch(() => {});
+      }
+    }
+    if (cleanText.trim()) {
+      for (const chunk of splitMessage(formatForTelegram(cleanText))) {
+        await bot.api.sendMessage(ALLOWED_CHAT_ID, chunk, { parse_mode: 'HTML' }).catch((err) =>
+          logger.error({ err }, 'Telegram status message failed'),
+        );
+      }
+    }
+  }
+
   // Dashboard only runs in the main bot process
   if (AGENT_ID === 'main') {
     startDashboard(bot.api);
@@ -266,7 +302,11 @@ async function main(): Promise<void> {
           proc.on('exit', (code, signal) => {
             clearTimeout(stableResetHandle);
             if (shuttingDown) return;
-            const wasIntentional = signal === 'SIGTERM' || signal === 'SIGKILL' || signal === 'SIGINT';
+            // A clean exit (code 0) means pipecat caught SIGTERM gracefully and shut
+            // down the runner cleanly. Treat that as intentional too, otherwise dashboard-
+            // initiated restarts (pin/language/provider changes via killWarroomAsync, which
+            // sends SIGTERM) get counted as crashes and disable the bot after 3.
+            const wasIntentional = code === 0 || signal === 'SIGTERM' || signal === 'SIGKILL' || signal === 'SIGINT';
             logger.warn({ code, signal, pid: proc.pid, intentional: wasIntentional }, 'War Room server exited');
             let delayMs: number;
             if (wasIntentional) {
@@ -315,20 +355,11 @@ async function main(): Promise<void> {
   }
 
   if (ALLOWED_CHAT_ID) {
-    initScheduler(
-      async (text) => {
-        // Split long messages to respect Telegram's 4096 char limit.
-        // The scheduler's splitMessage handles chunking, but the sender
-        // callback is also called directly for status messages which may exceed the limit.
-        const { splitMessage } = await import('./bot.js');
-        for (const chunk of splitMessage(text)) {
-          await bot.api.sendMessage(ALLOWED_CHAT_ID, chunk, { parse_mode: 'HTML' }).catch((err) =>
-            logger.error({ err }, 'Scheduler failed to send message'),
-          );
-        }
-      },
-      AGENT_ID,
-    );
+    // sendToPrimary handles marker extraction (SEND_FILE/SEND_PHOTO),
+    // chunking, and HTML formatting. Pass it directly so mission task
+    // completions can dispatch file attachments instead of leaking literal
+    // markers into chat.
+    initScheduler(sendToPrimary, AGENT_ID);
 
     // Proactive OAuth health monitoring — alerts via Telegram before the
     // Claude CLI token expires. OPT-IN as of 2026-04-10: users were getting

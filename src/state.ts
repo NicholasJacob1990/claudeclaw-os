@@ -33,7 +33,7 @@ export interface ChatEvent {
   chatId: string;
   agentId?: string;
   content?: string;
-  source?: 'telegram' | 'dashboard';
+  source?: 'telegram' | 'dashboard' | 'signal';
   description?: string;
   processing?: boolean;
   // Inline photo payload — emitted alongside assistant_message when the

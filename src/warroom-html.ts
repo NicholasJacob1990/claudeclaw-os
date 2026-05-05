@@ -758,6 +758,9 @@ export function getWarRoomHtml(token: string, chatId: string, warroomPort: numbe
         <div style="font-size:10px;color:rgba(255,255,255,0.35);margin-top:6px;line-height:1.4">
           <span id="mode-hint">Direct: talk to the pinned agent. Hand Up: the team listens, best-fit answers.</span>
         </div>
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.04);font-size:10px;color:rgba(255,255,255,0.35);line-height:1.4">
+          Voice provider &amp; output language are configured in the <a href="/" style="color:#a5b4fc;text-decoration:underline">Mission Control dashboard</a>.
+        </div>
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.04)">
           <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:rgba(255,255,255,0.4)">
             <span>&#9835; Entrance music</span>
@@ -1558,6 +1561,9 @@ function loadAgentCards() {
     .catch(function(e){ console.error('[WarRoom] Failed to load agents:', e); });
 }
 
+// Provider + language pins moved to Mission Control dashboard.
+// Endpoints stay the same: /api/warroom/{provider,language}.
+//
 // Load the initial pin state on page load so the UI reflects server state.
 // Runs AFTER loadAgentCards() resolves so _renderPin has cards in the DOM
 // to mark. When these ran in parallel, a slow agents API + fast pin API

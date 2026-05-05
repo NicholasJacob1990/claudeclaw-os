@@ -1253,6 +1253,120 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     return c.json({ ok: true, meetingId, entryCount: result.entryCount });
   });
 
+  // ── War Room output language ──
+  // Persists the user's pick to /tmp/warroom-language.json so the Python
+  // server reads it at start. Set null to clear (falls back to env or
+  // per-agent voices.json language). Valid BCP-47 codes only — Gemini
+  // Live ignores codes not in this map sometimes.
+  const WARROOM_LANGUAGE_PATH = '/tmp/warroom-language.json';
+  const VALID_LANG_CODES = new Set([
+    'auto', // multilingual mirror — STT unbiased, output matches user
+    'pt-BR', 'pt-PT', 'en-US', 'en-GB', 'es-ES', 'es-MX',
+    'fr-FR', 'de-DE', 'it-IT', 'ja-JP', 'zh-CN', 'ar-SA',
+  ]);
+
+  function readLanguageState(): { language: string | null } {
+    try {
+      if (fs.existsSync(WARROOM_LANGUAGE_PATH)) {
+        const raw = JSON.parse(fs.readFileSync(WARROOM_LANGUAGE_PATH, 'utf-8'));
+        const lang = raw && typeof raw.language === 'string' && VALID_LANG_CODES.has(raw.language)
+          ? raw.language : null;
+        return { language: lang };
+      }
+    } catch { /* fall through */ }
+    return { language: null };
+  }
+
+  app.get('/api/warroom/language', (c) => {
+    return c.json({ ok: true, ...readLanguageState() });
+  });
+
+  app.post('/api/warroom/language', async (c) => {
+    let body: { language?: string | null; restart?: boolean } = {};
+    try { body = await c.req.json(); } catch { /* empty body */ }
+
+    const lang = body.language;
+    if (lang !== null && lang !== '' && lang !== undefined && !VALID_LANG_CODES.has(lang)) {
+      return c.json({ ok: false, error: `invalid language code; must be one of ${[...VALID_LANG_CODES].join(', ')} or null` }, 400);
+    }
+
+    try {
+      if (lang === null || lang === '' || lang === undefined) {
+        if (fs.existsSync(WARROOM_LANGUAGE_PATH)) fs.unlinkSync(WARROOM_LANGUAGE_PATH);
+      } else {
+        fs.writeFileSync(
+          WARROOM_LANGUAGE_PATH,
+          JSON.stringify({ language: lang, pinnedAt: Date.now() }),
+          'utf-8',
+        );
+      }
+      const needsRestart = body.restart !== false;
+      if (needsRestart) killWarroomAsync(`language changed to ${lang ?? 'auto'}`);
+      return c.json({ ok: true, language: lang ?? null, respawning: needsRestart });
+    } catch (err) {
+      return c.json({ ok: false, error: String(err) }, 500);
+    }
+  });
+
+  // ── War Room voice provider ──
+  // Switch the underlying audio stack: Gemini Live (E2E), Groq (Whisper +
+  // Claude + PlayAI), or Cartesia (Deepgram + Claude + Cartesia legacy).
+  // Persists in /tmp/warroom-provider.json; warroom/server.py reads it on
+  // startup. Changing kills the subprocess so respawn picks up the new mode.
+  const WARROOM_PROVIDER_PATH = '/tmp/warroom-provider.json';
+  const VALID_PROVIDERS = new Set([
+    'gemini-live',     // Gemini 3.1 Flash Live (default, audio E2E)
+    'gemini-live-25',  // Gemini 2.5 native-audio (lower latency, mature)
+    'xai',             // xAI Grok Voice Agent (E2E, voices Ara/Eve/Leo/Rex/Sal)
+    'groq',            // Groq Whisper + Claude + Groq PlayAI
+    'cartesia',        // Deepgram + Claude + Cartesia (legacy stitched)
+    'elevenlabs',      // Groq Whisper STT + Claude + ElevenLabs TTS (voice-cloned via .env voice id)
+    'voxtral',         // Mistral Voxtral realtime STT (sub-200ms WS) + Claude + Voxtral TTS streaming (zero-shot ref_audio)
+  ]);
+
+  function readProviderState(): { provider: string | null } {
+    try {
+      if (fs.existsSync(WARROOM_PROVIDER_PATH)) {
+        const raw = JSON.parse(fs.readFileSync(WARROOM_PROVIDER_PATH, 'utf-8'));
+        const p = raw && typeof raw.provider === 'string' && VALID_PROVIDERS.has(raw.provider)
+          ? raw.provider : null;
+        return { provider: p };
+      }
+    } catch { /* fall through */ }
+    return { provider: null };
+  }
+
+  app.get('/api/warroom/provider', (c) => {
+    return c.json({ ok: true, ...readProviderState() });
+  });
+
+  app.post('/api/warroom/provider', async (c) => {
+    let body: { provider?: string | null; restart?: boolean } = {};
+    try { body = await c.req.json(); } catch { /* empty body */ }
+
+    const p = body.provider;
+    if (p !== null && p !== '' && p !== undefined && !VALID_PROVIDERS.has(p)) {
+      return c.json({ ok: false, error: `invalid provider; must be one of ${[...VALID_PROVIDERS].join(', ')} or null` }, 400);
+    }
+
+    try {
+      if (p === null || p === '' || p === undefined) {
+        if (fs.existsSync(WARROOM_PROVIDER_PATH)) fs.unlinkSync(WARROOM_PROVIDER_PATH);
+      } else {
+        fs.writeFileSync(
+          WARROOM_PROVIDER_PATH,
+          JSON.stringify({ provider: p, pinnedAt: Date.now() }),
+          'utf-8',
+        );
+      }
+      const needsRestart = body.restart !== false;
+      if (needsRestart) killWarroomAsync(`provider changed to ${p ?? 'default'}`);
+      return c.json({ ok: true, provider: p ?? null, respawning: needsRestart });
+    } catch (err) {
+      return c.json({ ok: false, error: String(err) }, 500);
+    }
+  });
+
   // ── War Room voice configuration ──
   // warroom/voices.json carries two voice identifiers per agent:
   //   - gemini_voice:     Gemini Live's built-in voice name (used in live mode)
@@ -1299,6 +1413,17 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   ];
   const GEMINI_VOICE_NAMES = new Set(GEMINI_VOICE_CATALOG.map((v) => v.name));
 
+  // xAI Grok Voice Agent voices. Five expressive options, all multilingual
+  // (20 languages). https://docs.x.ai/developers/model-capabilities/audio/voice
+  const XAI_VOICE_CATALOG = [
+    { name: 'Ara', style: 'warm female (default)' },
+    { name: 'Eve', style: 'youthful female' },
+    { name: 'Leo', style: 'confident male' },
+    { name: 'Rex', style: 'deep male' },
+    { name: 'Sal', style: 'neutral male' },
+  ];
+  const XAI_VOICE_NAMES = new Set(XAI_VOICE_CATALOG.map((v) => v.name));
+
   // Default voice assignments for agents that don't have an entry yet.
   // This is how a newly-spawned sub-agent gets a voice without any extra
   // setup. We skip Charon (reserved for main) so new agents always sound
@@ -1308,7 +1433,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     'Fenrir', 'Laomedeia', 'Achird', 'Sulafat', 'Vindemiatrix',
   ];
 
-  function readVoicesFile(): Record<string, { voice_id?: string; gemini_voice?: string; name?: string }> {
+  function readVoicesFile(): Record<string, { voice_id?: string; gemini_voice?: string; xai_voice?: string; name?: string }> {
     try {
       return JSON.parse(fs.readFileSync(WARROOM_VOICES_PATH, 'utf-8'));
     } catch {
@@ -1347,9 +1472,14 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         usedGeminiVoices.add(geminiVoice);
         isDefault = true;
       }
+      // xAI default: main → Ara, others rotate through the 5 voices
+      const xaiPool = ['Ara', 'Eve', 'Leo', 'Rex', 'Sal'];
+      const idx = knownAgents.indexOf(agent);
+      const xaiVoice = entry.xai_voice || xaiPool[idx % xaiPool.length];
       return {
         agent,
         gemini_voice: geminiVoice,
+        xai_voice: xaiVoice,
         voice_id: entry.voice_id || '',
         name: entry.name || '',
         is_default: isDefault,
@@ -1359,15 +1489,16 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       ok: true,
       voices: rows,
       gemini_catalog: GEMINI_VOICE_CATALOG,
+      xai_catalog: XAI_VOICE_CATALOG,
     });
   });
 
   app.post('/api/warroom/voices', async (c) => {
-    let body: { updates?: Array<{ agent: string; gemini_voice?: string; voice_id?: string; name?: string }> } = {};
+    let body: { updates?: Array<{ agent: string; gemini_voice?: string; xai_voice?: string; voice_id?: string; name?: string }> } = {};
     try { body = await c.req.json(); } catch { /* empty */ }
     const updates = body.updates;
     if (!Array.isArray(updates) || updates.length === 0) {
-      return c.json({ ok: false, error: 'updates must be a non-empty array of {agent, gemini_voice?, voice_id?, name?}' }, 400);
+      return c.json({ ok: false, error: 'updates must be a non-empty array of {agent, gemini_voice?, xai_voice?, voice_id?, name?}' }, 400);
     }
 
     const configured = readVoicesFile();
@@ -1384,6 +1515,13 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
           continue;
         }
         entry.gemini_voice = u.gemini_voice;
+      }
+      if (u.xai_voice !== undefined) {
+        if (typeof u.xai_voice !== 'string' || !XAI_VOICE_NAMES.has(u.xai_voice)) {
+          errors.push(`${u.agent}: invalid xai_voice '${u.xai_voice}' (must be one of Ara, Eve, Leo, Rex, Sal)`);
+          continue;
+        }
+        entry.xai_voice = u.xai_voice;
       }
       if (u.voice_id !== undefined) {
         if (typeof u.voice_id !== 'string') {
@@ -1887,7 +2025,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
           id,
           name: config.name,
           description: config.description,
-          model: mainOverride ?? config.model ?? 'claude-opus-4-6',
+          model: mainOverride ?? config.model ?? 'claude-opus-4-7',
           running,
           todayTurns: stats.todayTurns,
           todayCost: stats.todayCost,
@@ -1912,7 +2050,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     }
     const mainStats = getAgentTokenStats('main');
     const allAgents = [
-      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-6', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
+      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-7', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
       ...agents,
     ];
 
@@ -1952,7 +2090,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    const validModels = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model` }, 400);
 
     const agentIds = listAgentIds();
@@ -1977,7 +2115,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    const validModels = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model. Valid: ${validModels.join(', ')}` }, 400);
 
     try {

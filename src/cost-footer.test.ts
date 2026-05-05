@@ -26,14 +26,14 @@ describe('buildCostFooter', () => {
   });
 
   it('compact mode shows model only (no cost)', () => {
-    const result = buildCostFooter('compact', makeUsage(), 'claude-opus-4-6');
+    const result = buildCostFooter('compact', makeUsage(), 'claude-opus-4-7');
     expect(result).toContain('opus');
     expect(result).not.toContain('$');
     expect(result).not.toContain('45k');
   });
 
   it('verbose mode shows model + tokens (no cost)', () => {
-    const result = buildCostFooter('verbose', makeUsage(), 'claude-opus-4-6');
+    const result = buildCostFooter('verbose', makeUsage(), 'claude-opus-4-7');
     expect(result).toContain('opus');
     expect(result).toContain('45k in');
     expect(result).toContain('2k out');
@@ -41,14 +41,14 @@ describe('buildCostFooter', () => {
   });
 
   it('cost mode shows model + cost (no tokens)', () => {
-    const result = buildCostFooter('cost', makeUsage(), 'claude-opus-4-6');
+    const result = buildCostFooter('cost', makeUsage(), 'claude-opus-4-7');
     expect(result).toContain('opus');
     expect(result).toContain('$0.04');
     expect(result).not.toContain('45k in');
   });
 
   it('full mode shows model + tokens + cost', () => {
-    const result = buildCostFooter('full', makeUsage(), 'claude-opus-4-6');
+    const result = buildCostFooter('full', makeUsage(), 'claude-opus-4-7');
     expect(result).toContain('opus');
     expect(result).toContain('45k in');
     expect(result).toContain('2k out');
@@ -56,12 +56,12 @@ describe('buildCostFooter', () => {
   });
 
   it('formats large token counts with M suffix', () => {
-    const result = buildCostFooter('verbose', makeUsage({ inputTokens: 1_200_000 }), 'claude-opus-4-6');
+    const result = buildCostFooter('verbose', makeUsage({ inputTokens: 1_200_000 }), 'claude-opus-4-7');
     expect(result).toContain('1.2M in');
   });
 
   it('formats small token counts without suffix', () => {
-    const result = buildCostFooter('verbose', makeUsage({ outputTokens: 500 }), 'claude-opus-4-6');
+    const result = buildCostFooter('verbose', makeUsage({ outputTokens: 500 }), 'claude-opus-4-7');
     expect(result).toContain('500 out');
   });
 

@@ -482,8 +482,50 @@ async def answer_as_agent_handler(params):
 
 # Shared with the dashboard — any HTTP POST to /api/warroom/pin writes here.
 PIN_PATH = Path("/tmp/warroom-pin.json")
+LANGUAGE_PATH = Path("/tmp/warroom-language.json")
+PROVIDER_PATH = Path("/tmp/warroom-provider.json")
 
 VALID_MODES = {"direct", "auto"}
+VALID_PROVIDERS = {"gemini-live", "gemini-live-25", "xai", "groq", "cartesia"}
+
+
+def read_provider_pin() -> str | None:
+    """Return the voice-stack provider chosen via the dashboard, or None.
+
+    Values:
+      - "gemini-live"     Gemini 3.1 Flash Live (current default, audio E2E)
+      - "gemini-live-25"  Gemini 2.5 native-audio (lower latency, mature)
+      - "groq"            Groq Whisper STT + Claude bridge + Groq PlayAI TTS
+      - "cartesia"        Deepgram STT + Claude bridge + Cartesia TTS (legacy)
+
+    Falls back to WARROOM_MODE env when None.
+    """
+    if not PROVIDER_PATH.exists():
+        return None
+    try:
+        with open(PROVIDER_PATH, "r") as f:
+            data = json.load(f)
+        p = data.get("provider") if isinstance(data, dict) else None
+        return p if isinstance(p, str) and p in VALID_PROVIDERS else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def read_language_pin() -> str | None:
+    """Return the language code pinned via the dashboard, or None.
+
+    Highest-priority language source. Falls back (in server start_live) to
+    per-agent voices.json then WARROOM_LANGUAGE env then no pin.
+    """
+    if not LANGUAGE_PATH.exists():
+        return None
+    try:
+        with open(LANGUAGE_PATH, "r") as f:
+            data = json.load(f)
+        lang = data.get("language") if isinstance(data, dict) else None
+        return lang if isinstance(lang, str) and lang else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
 
 
 def read_pin_state() -> tuple[str, str]:
@@ -547,7 +589,12 @@ async def run_live_mode():
     active_entry = AGENT_VOICES.get(voice_agent) or AGENT_VOICES.get("main", {})
     configured_voice = active_entry.get("gemini_voice") or "Charon"
     voice = os.environ.get("WARROOM_LIVE_VOICE", configured_voice)
-    system_prompt = get_persona(active_agent, mode=active_mode)
+    # Language resolution (top wins):
+    #   1. dashboard pick (/tmp/warroom-language.json)
+    #   2. per-agent voices.json "language"
+    #   3. WARROOM_LANGUAGE env var (handled inside get_persona)
+    resolved_language = read_language_pin() or active_entry.get("language")
+    system_prompt = get_persona(active_agent, mode=active_mode, language=resolved_language)
 
     transport = make_transport(port)
 
@@ -648,6 +695,28 @@ async def run_live_mode():
     # even for main (Charon). Pipecat only warns about deprecation, not
     # actively breaks.
     live_kwargs["voice_id"] = voice
+
+    # Pin Gemini Live's input speech recognition to the same language we
+    # ask it to respond in. system_instruction only controls OUTPUT;
+    # Settings.language controls STT (wired to SpeechConfig.language_code
+    # in pipecat/.../gemini_live/llm.py:1277).
+    #
+    # Three regimes:
+    #   - resolved_language is a real BCP-47 code → lock STT + output
+    #   - resolved_language == "auto" → DO NOT pin STT (Pipecat default
+    #     en-US is sent, but the native-audio model handles multilingual
+    #     under the hood and accepts code-switching). The persona prefix
+    #     tells the model to mirror the user's language on output.
+    #   - resolved_language is None → no STT pin, no output directive
+    #     (legacy auto-detect behavior — drifts).
+    if resolved_language and resolved_language != "auto":
+        try:
+            live_kwargs["settings"] = GeminiLiveLLMService.Settings(language=resolved_language)
+            logger.info("Gemini Live STT language pinned to %s", resolved_language)
+        except Exception as exc:
+            logger.warning("Could not set Gemini Live STT language to %s: %s", resolved_language, exc)
+    elif resolved_language == "auto":
+        logger.info("Gemini Live in multilingual auto mode (output mirrors user's language)")
 
     llm = GeminiLiveLLMService(**live_kwargs)
 
@@ -780,10 +849,452 @@ async def run_legacy_mode():
     logger.info("War Room session ended.")
 
 
+# ─── Mode 3: xAI Grok Voice Agent (E2E realtime, similar to Gemini Live) ──
+
+async def run_xai_mode():
+    """xAI Grok Voice Agent: E2E audio realtime (like Gemini Live).
+
+    Grok handles STT + LLM + TTS in one session. Voices: Ara (default), Rex,
+    Sal, Eve, Leo. Configure via WARROOM_XAI_VOICE env or voices.json field.
+    Tools (delegate_to_agent etc.) are not yet wired here — future work.
+    """
+    from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
+    from pipecat.services.xai.realtime import events as xai_events
+
+    check_required_keys({
+        "XAI_API_KEY": "xAI Grok (Voice Agent realtime)",
+    })
+
+    port = int(os.environ.get("WARROOM_PORT", "7860"))
+
+    active_agent, active_mode = read_pin_state()
+    agent_entry = AGENT_VOICES.get(active_agent, {})
+    # Per-agent voice from voices.json wins over env default ("Ara").
+    voice = agent_entry.get("xai_voice") or os.environ.get("WARROOM_XAI_VOICE", "Ara")
+    resolved_language = read_language_pin() or agent_entry.get("language")
+    system_prompt = get_persona(active_agent, mode=active_mode, language=resolved_language)
+
+    transport = make_transport(port)
+
+    session_properties = xai_events.SessionProperties(
+        instructions=system_prompt,
+        voice=voice,
+    )
+
+    llm = GrokRealtimeLLMService(
+        api_key=os.environ["XAI_API_KEY"],
+        session_properties=session_properties,
+    )
+
+    pipeline = Pipeline([
+        transport.input(),
+        llm,
+        transport.output(),
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
+    )
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected (xai mode, voice=%s)", voice)
+
+    print_ready(port, "xai")
+    runner = PipelineRunner(handle_sigterm=True)
+    logger.info("War Room XAI mode on ws://0.0.0.0:%d (voice=%s agent=%s)", port, voice, active_agent)
+    await runner.run(task)
+    logger.info("War Room session ended.")
+
+
+# ─── Mode 4: Groq stitched pipeline (low latency, Claude in the middle) ──
+
+async def run_groq_mode():
+    """Groq Whisper STT → Claude Code bridge → Groq PlayAI TTS.
+
+    Lower-latency alternative to Gemini Live for users who want Claude (with
+    full skills/MCPs) handling the LLM step instead of Gemini. The TTS stays
+    on Groq's PlayAI Orpheus model — multilingual, ~200ms first-byte.
+    """
+    from pipecat.services.groq.stt import GroqSTTService
+    from pipecat.services.groq.tts import GroqTTSService
+    from router import AgentRouter
+    from agent_bridge import ClaudeAgentBridge
+
+    check_required_keys({
+        "GROQ_API_KEY": "Groq (Whisper STT + PlayAI TTS)",
+    })
+
+    port = int(os.environ.get("WARROOM_PORT", "7860"))
+
+    transport = make_transport(port)
+
+    # Whisper-large-v3 is Groq's default; multilingual.
+    stt = GroqSTTService(api_key=os.environ["GROQ_API_KEY"])
+    # Voice override from env, otherwise Orpheus default ("autumn", en-US-ish
+    # but handles PT/ES decently). Per-agent voice via voices.json could be
+    # added later once we have a voice catalog mapping.
+    tts_voice = os.environ.get("WARROOM_GROQ_VOICE", "autumn")
+    tts = GroqTTSService(api_key=os.environ["GROQ_API_KEY"], voice_id=tts_voice)
+
+    router = AgentRouter()
+    bridge = ClaudeAgentBridge()
+
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        router,
+        bridge,
+        tts,
+        transport.output(),
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
+    )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected; keeping pipeline alive for next meeting")
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected (groq mode, voice=%s)", tts_voice)
+
+    print_ready(port, "groq")
+    runner = PipelineRunner(handle_sigterm=True)
+    logger.info("War Room GROQ mode on ws://0.0.0.0:%d (voice=%s)", port, tts_voice)
+    await runner.run(task)
+    logger.info("War Room session ended.")
+
+
+async def run_elevenlabs_mode():
+    """Groq Whisper STT → Claude bridge → ElevenLabs TTS.
+
+    ElevenLabs is the highest-quality multilingual TTS but is *not* end-to-end
+    (no streaming STT of its own). We pair it with Groq Whisper which is
+    cheap, ~200ms-first-token, and shares the multilingual property. The LLM
+    step stays on Claude (with full skills/MCPs) via the same bridge as Groq
+    mode — only the TTS service differs.
+
+    Voice picks the env-configured ELEVENLABS_VOICE_ID (per-agent voices.json
+    overrides via voices_id field once we plumb it; currently global).
+    """
+    from pipecat.services.groq.stt import GroqSTTService
+    from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+    from router import AgentRouter
+    from agent_bridge import ClaudeAgentBridge
+
+    check_required_keys({
+        "GROQ_API_KEY": "Whisper STT (ElevenLabs has no STT of its own)",
+        "ELEVENLABS_API_KEY": "ElevenLabs TTS",
+        "ELEVENLABS_VOICE_ID": "ElevenLabs voice (e.g. Sarah=EXAVITQu4vr4xnSDxMaL)",
+    })
+
+    port = int(os.environ.get("WARROOM_PORT", "7860"))
+    transport = make_transport(port)
+
+    stt = GroqSTTService(api_key=os.environ["GROQ_API_KEY"])
+    voice_id = os.environ["ELEVENLABS_VOICE_ID"]
+    tts = ElevenLabsTTSService(
+        api_key=os.environ["ELEVENLABS_API_KEY"],
+        voice_id=voice_id,
+        # Multilingual v2 handles PT-BR + EN code-switch reliably; eleven_turbo_v2_5
+        # is faster but EN-only by default. Override with WARROOM_ELEVENLABS_MODEL.
+        model=os.environ.get("WARROOM_ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+    )
+
+    router = AgentRouter()
+    bridge = ClaudeAgentBridge()
+
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        router,
+        bridge,
+        tts,
+        transport.output(),
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
+    )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected; keeping pipeline alive for next meeting")
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected (elevenlabs mode, voice=%s)", voice_id)
+
+    print_ready(port, "elevenlabs")
+    runner = PipelineRunner(handle_sigterm=True)
+    logger.info(
+        "War Room ELEVENLABS mode on ws://0.0.0.0:%d (voice=%s, stt=groq-whisper)",
+        port, voice_id,
+    )
+    await runner.run(task)
+    logger.info("War Room session ended.")
+
+
+async def run_voxtral_mode():
+    """Mistral Voxtral realtime STT (sub-200ms WS) → Claude bridge → Voxtral TTS streaming.
+
+    Voxtral is Mistral's audio stack released 2025: realtime STT via WebSocket
+    (`voxtral-mini-transcribe-realtime-2602`) and streaming TTS with zero-shot
+    voice cloning (`voxtral-mini-tts-2603`). Pipecat doesn't ship official
+    services for these yet (only Mistral LLM), so this mode wraps the raw
+    Mistral SDK in custom pipecat FrameProcessors defined inline below.
+
+    LLM stays on Claude (with skills/MCPs) for parity with groq/elevenlabs
+    modes — Voxtral STT/TTS bookends the Claude bridge. Set
+    WARROOM_VOXTRAL_VOICE_ID to a saved voice; otherwise falls back to base64
+    ref_audio from WARROOM_VOXTRAL_REF_AUDIO_PATH (zero-shot clone) or the
+    default Voxtral preset voice.
+    """
+    from pipecat.services.groq.stt import GroqSTTService
+    from router import AgentRouter
+    from agent_bridge import ClaudeAgentBridge
+
+    check_required_keys({
+        "MISTRAL_API_KEY": "Voxtral STT/TTS via Mistral API",
+    })
+
+    # Voxtral STT/TTS pipecat frame processors — defined here because pipecat
+    # has no upstream service yet. Lazy-imports mistralai SDK so other modes
+    # don't fail if the package isn't installed.
+    voxtral_stt, voxtral_tts = await _build_voxtral_services()
+
+    # Allow overriding STT to Groq Whisper if the user wants Voxtral TTS only
+    # (e.g. while debugging the realtime WS path). Default uses Voxtral STT.
+    use_voxtral_stt = os.environ.get("WARROOM_VOXTRAL_STT", "true").strip().lower() != "false"
+    stt = voxtral_stt if use_voxtral_stt else GroqSTTService(api_key=os.environ.get("GROQ_API_KEY", ""))
+
+    port = int(os.environ.get("WARROOM_PORT", "7860"))
+    transport = make_transport(port)
+
+    router = AgentRouter()
+    bridge = ClaudeAgentBridge()
+
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        router,
+        bridge,
+        voxtral_tts,
+        transport.output(),
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
+    )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected; keeping pipeline alive for next meeting")
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected (voxtral mode, stt=%s)", "voxtral" if use_voxtral_stt else "groq")
+
+    print_ready(port, "voxtral")
+    runner = PipelineRunner(handle_sigterm=True)
+    logger.info(
+        "War Room VOXTRAL mode on ws://0.0.0.0:%d (stt=%s, tts=voxtral-mini-tts-2603)",
+        port, "voxtral-realtime" if use_voxtral_stt else "groq-whisper",
+    )
+    await runner.run(task)
+    logger.info("War Room session ended.")
+
+
+async def _build_voxtral_services():
+    """Construct custom pipecat STT + TTS services backed by the Mistral SDK.
+
+    Imports are deferred so missing mistralai package only breaks voxtral mode,
+    not other providers. Both services subclass pipecat AIService so they
+    plug into the standard Pipeline.
+    """
+    try:
+        from mistralai.client import Mistral
+    except ImportError as exc:
+        raise RuntimeError(
+            "mistralai SDK not installed. Run: warroom/.venv/bin/pip install 'mistralai>=2.4'"
+        ) from exc
+
+    from pipecat.frames.frames import (
+        Frame,
+        InputAudioRawFrame,
+        TranscriptionFrame,
+        TTSAudioRawFrame,
+        TTSStartedFrame,
+        TTSStoppedFrame,
+        TextFrame,
+    )
+    from pipecat.services.ai_service import AIService
+
+    api_key = os.environ["MISTRAL_API_KEY"]
+    stt_model = os.environ.get(
+        "WARROOM_VOXTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"
+    )
+    tts_model = os.environ.get("WARROOM_VOXTRAL_TTS_MODEL", "voxtral-mini-tts-2603")
+    voice_id = os.environ.get("WARROOM_VOXTRAL_VOICE_ID", "")
+    ref_audio_path = os.environ.get("WARROOM_VOXTRAL_REF_AUDIO_PATH", "")
+
+    # Pre-load ref_audio once so cloning doesn't reread the file on every
+    # synthesize call. Empty string when neither voice_id nor ref_audio set
+    # → Mistral falls back to its built-in preset voice.
+    ref_audio_b64 = ""
+    if ref_audio_path and not voice_id:
+        try:
+            import base64
+            with open(ref_audio_path, "rb") as f:
+                ref_audio_b64 = base64.b64encode(f.read()).decode()
+        except OSError as exc:
+            logger.warning("Could not read voxtral ref_audio %s: %s", ref_audio_path, exc)
+
+    class VoxtralRealtimeSTT(AIService):
+        """Streams PcmS16le 16kHz audio frames to Voxtral realtime WebSocket
+        and emits TranscriptionFrame on each text delta.
+
+        Lazy-connects on first audio frame; reconnects on disconnect. Does NOT
+        re-encode — pipecat's transport already delivers 16kHz PCM frames so
+        we forward bytes directly to the WS.
+        """
+        def __init__(self):
+            super().__init__()
+            self._mistral = Mistral(api_key=api_key)
+            self._stream_ctx = None
+            self._stream_iter = None
+            self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+            self._stream_task: asyncio.Task | None = None
+
+        async def _audio_generator(self):
+            while True:
+                chunk = await self._audio_queue.get()
+                if chunk is None:  # sentinel for shutdown
+                    return
+                yield chunk
+
+        async def _ensure_stream(self):
+            if self._stream_task is not None:
+                return
+            try:
+                from mistralai.extra.realtime.transcription import (
+                    RealtimeTranscription, AudioFormat,
+                )
+            except ImportError:
+                logger.error(
+                    "mistralai>=2.4 with realtime extras required for Voxtral STT realtime"
+                )
+                raise
+
+            client = RealtimeTranscription(api_key=api_key)
+            self._stream_iter = client.transcribe_stream(
+                self._audio_generator(),
+                stt_model,
+                audio_format=AudioFormat(encoding="pcm_s16le", sample_rate=16000),
+            )
+            self._stream_task = asyncio.create_task(self._consume_transcripts())
+
+        async def _consume_transcripts(self):
+            assert self._stream_iter is not None
+            async for event in self._stream_iter:
+                if event.type == "transcription.text.delta":
+                    await self.push_frame(TranscriptionFrame(event.text, "voxtral", None))
+                elif event.type == "transcription.done":
+                    break
+                elif event.type == "error":
+                    logger.error("Voxtral STT realtime error: %s", event.error)
+                    break
+
+        async def process_frame(self, frame: Frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, InputAudioRawFrame):
+                await self._ensure_stream()
+                await self._audio_queue.put(frame.audio)
+            else:
+                await self.push_frame(frame, direction)
+
+        async def cleanup(self):
+            await self._audio_queue.put(None)  # sentinel
+            if self._stream_task is not None:
+                self._stream_task.cancel()
+            await super().cleanup()
+
+    class VoxtralStreamingTTS(AIService):
+        """Calls Mistral /v1/audio/speech with stream=true and forwards PCM
+        audio chunks as TTSAudioRawFrame. Re-encodes from opus → pcm via
+        base64 decode + (optional) ffmpeg if pipecat transport requires PCM.
+        """
+        def __init__(self):
+            super().__init__()
+            self._client = Mistral(api_key=api_key)
+
+        async def _synthesize(self, text: str):
+            kwargs = {
+                "model": tts_model,
+                "input": text,
+                "response_format": "pcm",  # match transport output sample format
+                "stream": True,
+            }
+            if voice_id:
+                kwargs["voice_id"] = voice_id
+            elif ref_audio_b64:
+                kwargs["ref_audio"] = ref_audio_b64
+            # Else: Mistral uses its preset default voice.
+
+            await self.push_frame(TTSStartedFrame())
+            stream = await self._client.audio.speech.complete_async(**kwargs)
+            try:
+                async for event in stream:
+                    if getattr(event, "event", None) == "speech.audio.delta":
+                        import base64
+                        audio_bytes = base64.b64decode(event.data.audio_data)
+                        await self.push_frame(TTSAudioRawFrame(audio_bytes, 24000, 1))
+            finally:
+                await self.push_frame(TTSStoppedFrame())
+
+        async def process_frame(self, frame: Frame, direction):
+            await super().process_frame(frame, direction)
+            if isinstance(frame, TextFrame) and frame.text:
+                await self._synthesize(frame.text)
+            else:
+                await self.push_frame(frame, direction)
+
+    return VoxtralRealtimeSTT(), VoxtralStreamingTTS()
+
+
 # ─── Entry point ───────────────────────────────────────────────────────────
 
 async def run_warroom():
     load_env()
+    # Provider pin from dashboard takes precedence over WARROOM_MODE env.
+    pinned_provider = read_provider_pin()
+    if pinned_provider == "xai":
+        await run_xai_mode()
+        return
+    if pinned_provider == "groq":
+        await run_groq_mode()
+        return
+    if pinned_provider == "cartesia":
+        await run_legacy_mode()
+        return
+    if pinned_provider == "elevenlabs":
+        await run_elevenlabs_mode()
+        return
+    if pinned_provider == "voxtral":
+        await run_voxtral_mode()
+        return
+    if pinned_provider == "gemini-live-25":
+        # Override the model env so the live path picks the older fast model
+        os.environ["WARROOM_LIVE_MODEL"] = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+        # Fall through to live mode
+
     mode = os.environ.get("WARROOM_MODE", "live").strip().lower()
     if mode == "legacy":
         await run_legacy_mode()

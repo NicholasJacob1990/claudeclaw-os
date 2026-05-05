@@ -3,12 +3,13 @@ import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
-import { AGENT_MAX_TURNS, PROJECT_ROOT, agentCwd } from './config.js';
+import { AGENT_MAX_TURNS, AGENT_USE_V2_SESSIONS, PROJECT_ROOT, agentCwd } from './config.js';
 import { readEnvFile } from './env.js';
 import { classifyError, AgentError } from './errors.js';
 import { logger } from './logger.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { requireEnabled } from './kill-switches.js';
+import { runPooledTurn, sessionPoolKey } from './claude-session-pool.js';
 
 // ── MCP server loading ──────────────────────────────────────────────
 // The Agent SDK's settingSources loads CLAUDE.md and permissions from
@@ -181,6 +182,7 @@ export async function runAgent(
   abortController?: AbortController,
   onStreamText?: (accumulatedText: string) => void,
   mcpAllowlist?: string[],
+  poolKey?: string,
 ): Promise<AgentResult> {
   // Centralized kill-switch enforcement. Throws KillSwitchDisabledError if
   // LLM_SPAWN_ENABLED has been flipped off — caller is expected to surface
@@ -224,6 +226,140 @@ export async function runAgent(
 
     // SDK Options.mcpServers expects Record<string, McpServerConfig>
     const mcpServerSpecs = mcpServerNames.length > 0 ? mcpServers : undefined;
+
+    // ── Persistent subprocess pool path (v2 sessions) ────────────────
+    // Reuse a long-lived `claude` subprocess keyed by (poolKey × cwd × model × mcpset)
+    // to skip the ~50s spawn+MCP load cost on every turn after the first.
+    // On any failure, fall through to the v1 `query()` path below.
+    if (AGENT_USE_V2_SESSIONS && poolKey) {
+      const effectiveModel = model ?? 'claude-sonnet-4-6';
+      const effectiveCwd = agentCwd ?? PROJECT_ROOT;
+      const key = sessionPoolKey({
+        chatId: poolKey,
+        agentId: agentCwd ? path.basename(agentCwd) : 'main',
+        cwd: effectiveCwd,
+        model: effectiveModel,
+        mcpNames: mcpServerNames,
+      });
+
+      try {
+        const pooled = await runPooledTurn(
+          key,
+          message,
+          {
+            model: effectiveModel,
+            cwd: effectiveCwd,
+            env: sdkEnv,
+            mcpServers: mcpServerSpecs,
+            settingSources: ['project', 'user'],
+            permissionMode: 'bypassPermissions',
+            ...(AGENT_MAX_TURNS > 0 ? { maxTurns: AGENT_MAX_TURNS } : {}),
+            ...(sessionId ? { resume: sessionId } : {}),
+            ...(abortController ? { abortController } : {}),
+          },
+          {
+            onInit: (sid) => {
+              newSessionId = sid;
+              logger.info({ newSessionId, pooled: true }, 'Session initialized');
+            },
+            onCompact: (trigger, preTokens) => {
+              didCompact = true;
+              preCompactTokens = preTokens;
+              logger.warn({ trigger, preCompactTokens }, 'Context window compacted');
+            },
+            onTaskStarted: (desc) => onProgress?.({ type: 'task_started', description: desc }),
+            onTaskCompleted: (status, summary) => onProgress?.({
+              type: 'task_completed',
+              description: status === 'failed' ? `Failed: ${summary}` : summary,
+            }),
+            onAssistant: (ev) => {
+              const msg = ev['message'] as Record<string, unknown> | undefined;
+              const msgUsage = msg?.['usage'] as Record<string, number> | undefined;
+              const callCacheRead = msgUsage?.['cache_read_input_tokens'] ?? 0;
+              const callInputTokens = msgUsage?.['input_tokens'] ?? 0;
+              if (callCacheRead > 0) lastCallCacheRead = callCacheRead;
+              if (callInputTokens > 0) lastCallInputTokens = callInputTokens;
+
+              if (onProgress) {
+                const content = msg?.['content'] as Array<{ type: string; name?: string }> | undefined;
+                if (Array.isArray(content)) {
+                  for (const block of content) {
+                    if (block.type === 'tool_use' && block.name) {
+                      onProgress({ type: 'tool_active', description: toolLabel(block.name) });
+                    }
+                  }
+                }
+              }
+            },
+            onStream: (ev) => {
+              if (!onStreamText || ev['parent_tool_use_id'] !== null) return;
+              const streamEvent = ev['event'] as Record<string, unknown> | undefined;
+              if (streamEvent?.['type'] === 'message_start') streamedText = '';
+              if (streamEvent?.['type'] === 'content_block_delta') {
+                const delta = streamEvent['delta'] as Record<string, unknown> | undefined;
+                if (delta?.['type'] === 'text_delta' && typeof delta['text'] === 'string') {
+                  streamedText += delta['text'];
+                  onStreamText(streamedText);
+                }
+              }
+            },
+            onResult: (ev) => {
+              resultText = (ev['result'] as string | null | undefined) ?? null;
+              const evUsage = ev['usage'] as Record<string, number> | undefined;
+              if (evUsage) {
+                usage = {
+                  inputTokens: evUsage['input_tokens'] ?? 0,
+                  outputTokens: evUsage['output_tokens'] ?? 0,
+                  cacheReadInputTokens: evUsage['cache_read_input_tokens'] ?? 0,
+                  totalCostUsd: (ev['total_cost_usd'] as number) ?? 0,
+                  didCompact,
+                  preCompactTokens,
+                  lastCallCacheRead,
+                  lastCallInputTokens,
+                };
+                logger.info(
+                  {
+                    inputTokens: usage.inputTokens,
+                    cacheReadTokens: usage.cacheReadInputTokens,
+                    lastCallCacheRead: usage.lastCallCacheRead,
+                    lastCallInputTokens: usage.lastCallInputTokens,
+                    costUsd: usage.totalCostUsd,
+                    didCompact,
+                    pooled: true,
+                  },
+                  'Turn usage',
+                );
+              }
+              logger.info(
+                { hasResult: !!resultText, subtype: ev['subtype'], pooled: true },
+                'Agent result received',
+              );
+            },
+          },
+        );
+        if (pooled.sessionId && !newSessionId) newSessionId = pooled.sessionId;
+        clearInterval(typingInterval);
+        return { text: resultText, newSessionId, usage };
+      } catch (poolErr) {
+        if (abortController?.signal.aborted) {
+          clearInterval(typingInterval);
+          return { text: null, newSessionId, usage, aborted: true };
+        }
+        logger.warn(
+          { err: (poolErr as Error)?.message, key },
+          'Pooled session failed, falling back to v1 query',
+        );
+        // reset per-turn state that may have been partially populated
+        newSessionId = undefined;
+        resultText = null;
+        usage = null;
+        didCompact = false;
+        preCompactTokens = null;
+        lastCallCacheRead = 0;
+        lastCallInputTokens = 0;
+        streamedText = '';
+      }
+    }
 
     for await (const event of query({
       prompt: singleTurn(message),
@@ -421,6 +557,7 @@ export async function runAgentWithRetry(
   onRetry?: (attempt: number, error: AgentError) => void,
   fallbackModels?: string[],
   mcpAllowlist?: string[],
+  poolKey?: string,
 ): Promise<AgentResult> {
   let lastError: AgentError | undefined;
 
@@ -435,7 +572,7 @@ export async function runAgentWithRetry(
       return await runAgent(
         message, sessionId, onTyping, onProgress,
         currentModel, abortController, onStreamText,
-        mcpAllowlist,
+        mcpAllowlist, poolKey,
       );
     } catch (err) {
       if (!(err instanceof AgentError)) throw err;

@@ -18,6 +18,55 @@ Shared rules across all personas (applied via the SHARED_RULES header):
   Claude Code stack and pings the user on Telegram when done.
 """
 
+# Map BCP-47 codes to a human-readable name + native sample so the
+# instruction is unambiguous to Gemini Live (which sometimes ignores
+# bare codes and prefers phrased directives).
+LANGUAGE_NAMES = {
+    "pt-BR": "Brazilian Portuguese",
+    "pt-PT": "European Portuguese",
+    "en-US": "American English",
+    "en-GB": "British English",
+    "es-ES": "Spanish (Spain)",
+    "es-MX": "Mexican Spanish",
+    "fr-FR": "French",
+    "de-DE": "German",
+    "it-IT": "Italian",
+    "ja-JP": "Japanese",
+    "zh-CN": "Mandarin Chinese (Simplified)",
+    "ar-SA": "Arabic",
+}
+
+
+def build_language_directive(code: str | None) -> str:
+    """Return a strong system_instruction prefix that pins output language.
+
+    - None / empty: no directive (Gemini auto-detects, may drift to other
+      languages — original buggy behavior, kept for back-compat).
+    - "auto": mirror directive — STT runs unbiased, output matches whatever
+      language the user just spoke. Best for code-switching speakers.
+    - Specific code (e.g. "pt-BR"): hard lock — STT biased to that language,
+      output forced to that language regardless of code-switching.
+    """
+    if not code:
+        return ""
+    if code == "auto":
+        return (
+            "OUTPUT LANGUAGE (highest priority, overrides everything below):\n"
+            "Mirror the user's language. If their last utterance was in Portuguese, "
+            "answer in Portuguese. If in English, answer in English. If they "
+            "code-switch within one utterance, answer in whichever language "
+            "dominated. Never answer in a language the user did not just speak.\n\n"
+        )
+    name = LANGUAGE_NAMES.get(code, code)
+    return (
+        f"OUTPUT LANGUAGE (highest priority, overrides everything below):\n"
+        f"You MUST respond ONLY in {name} ({code}), regardless of what language "
+        f"the user speaks. If they speak another language, understand them, but "
+        f"answer in {name}. Never switch to another output language under any "
+        f"circumstance.\n\n"
+    )
+
+
 SHARED_RULES = """HARD RULES (never break these):
 - No em dashes. Ever.
 - No AI clichés. Never say "Certainly", "Great question", "I'd be happy to", "As an AI", "absolutely", or any variation.
@@ -182,17 +231,24 @@ def _build_auto_roster_block() -> str:
     return "\n".join(f"- {k}: {v}" for k, v in _known.items())
 
 
-def get_persona(agent_id: str, mode: str = "direct") -> str:
+def get_persona(agent_id: str, mode: str = "direct", language: str | None = None) -> str:
     """Return the persona for an agent.
 
     In auto mode, returns the router persona with a dynamic agent roster.
     In direct mode, returns the agent-specific persona, falling back to
     a dynamically generated one for custom agents.
+
+    `language` (BCP-47, e.g. "pt-BR") prepends a hard directive so Gemini
+    Live answers in that language regardless of what the user speaks.
+    Resolution order: explicit arg → WARROOM_LANGUAGE env var → no pin.
     """
+    import os
+    effective_lang = language or os.environ.get("WARROOM_LANGUAGE") or None
+    prefix = build_language_directive(effective_lang)
+
     if mode == "auto":
-        # Inject dynamic roster into the auto-router persona
         roster = _build_auto_roster_block()
-        return AUTO_ROUTER_PERSONA.replace(
+        body = AUTO_ROUTER_PERSONA.replace(
             "- main: Hand of the King. General ops, triage, anything that doesn't clearly fit another agent.\n"
             "- research: Grand Maester. Deep web research, academic sources, competitive intel, trend analysis.\n"
             "- comms: Master of Whisperers. Email, Slack, Telegram, WhatsApp, customer comms, inbox triage.\n"
@@ -200,4 +256,6 @@ def get_persona(agent_id: str, mode: str = "direct") -> str:
             "- ops: Master of War. Calendar, scheduling, cron, system operations, MCP tool work, automations.",
             roster,
         )
-    return AGENT_PERSONAS.get(agent_id) or _generate_persona(agent_id)
+        return prefix + body
+    body = AGENT_PERSONAS.get(agent_id) or _generate_persona(agent_id)
+    return prefix + body

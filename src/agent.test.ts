@@ -12,8 +12,14 @@ vi.mock('./env.js', () => ({
 
 vi.mock('./config.js', () => ({
   AGENT_MAX_TURNS: 30,
+  AGENT_USE_V2_SESSIONS: false,
   PROJECT_ROOT: '/tmp/test',
   agentCwd: undefined,
+}));
+
+vi.mock('./claude-session-pool.js', () => ({
+  runPooledTurn: vi.fn(),
+  sessionPoolKey: vi.fn(() => 'test-key'),
 }));
 
 vi.mock('./logger.js', () => ({
@@ -193,12 +199,12 @@ describe('runAgentWithRetry', () => {
 
     const result = await runAgentWithRetry(
       'hi', undefined, noop, undefined,
-      'claude-opus-4-6', undefined, undefined, undefined,
+      'claude-opus-4-7', undefined, undefined, undefined,
       ['claude-sonnet-4-6', 'claude-haiku-4-5'],
     );
 
     expect(result.text).toBe('Fallback worked');
-    expect(capturedModels[0]).toBe('claude-opus-4-6');
+    expect(capturedModels[0]).toBe('claude-opus-4-7');
     expect(capturedModels[1]).toBe('claude-sonnet-4-6');
   }, 15000);
 });

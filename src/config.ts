@@ -7,7 +7,13 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'TELEGRAM_BOT_TOKEN',
   'ALLOWED_CHAT_ID',
+  'MESSENGER_TYPE',
+  'SIGNAL_PHONE_NUMBER',
+  'SIGNAL_RPC_HOST',
+  'SIGNAL_RPC_PORT',
+  'SIGNAL_AUTHORIZED_RECIPIENTS',
   'GROQ_API_KEY',
+  'MISTRAL_API_KEY',
   'ELEVENLABS_API_KEY',
   'ELEVENLABS_VOICE_ID',
   'WHATSAPP_ENABLED',
@@ -20,6 +26,7 @@ const envConfig = readEnvFile([
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
   'AGENT_TIMEOUT_MS',
+  'MISSION_TIMEOUT_MS',
   'AGENT_MAX_TURNS',
   'SECURITY_PIN_HASH',
   'IDLE_LOCK_MINUTES',
@@ -27,6 +34,7 @@ const envConfig = readEnvFile([
   'MODEL_FALLBACK_CHAIN',
   'SMART_ROUTING_ENABLED',
   'SMART_ROUTING_CHEAP_MODEL',
+  'AGENT_USE_V2_SESSIONS',
   'SHOW_COST_FOOTER',
   'DAILY_COST_BUDGET',
   'HOURLY_TOKEN_BUDGET',
@@ -83,6 +91,29 @@ export const TELEGRAM_BOT_TOKEN =
 // Only respond to this Telegram chat ID. Set this after getting your ID via /chatid.
 export const ALLOWED_CHAT_ID =
   process.env.ALLOWED_CHAT_ID || envConfig.ALLOWED_CHAT_ID || '';
+
+// ── Messenger adapter selection ──────────────────────────────────────
+// Which messenger front-end runs: 'telegram' (default, grammy via bot.ts)
+// or 'signal' (signal-cli JSON-RPC via signal-bot.ts). Picked once at
+// startup in index.ts; the two code paths never run simultaneously.
+export type MessengerType = 'telegram' | 'signal';
+export const MESSENGER_TYPE: MessengerType =
+  ((process.env.MESSENGER_TYPE || envConfig.MESSENGER_TYPE || 'telegram').toLowerCase() as MessengerType);
+
+// ── Signal (alternative messenger via signal-cli) ────────────────────
+export const SIGNAL_PHONE_NUMBER =
+  process.env.SIGNAL_PHONE_NUMBER || envConfig.SIGNAL_PHONE_NUMBER || '';
+export const SIGNAL_RPC_HOST =
+  process.env.SIGNAL_RPC_HOST || envConfig.SIGNAL_RPC_HOST || '127.0.0.1';
+export const SIGNAL_RPC_PORT = parseInt(
+  process.env.SIGNAL_RPC_PORT || envConfig.SIGNAL_RPC_PORT || '7583',
+  10,
+);
+// Comma-separated list of allowed sender numbers. Messages from anyone
+// else get dropped with a single audit entry. Usually just your own number.
+export const SIGNAL_AUTHORIZED_RECIPIENTS = (
+  process.env.SIGNAL_AUTHORIZED_RECIPIENTS || envConfig.SIGNAL_AUTHORIZED_RECIPIENTS || ''
+).split(',').map((s) => s.trim()).filter(Boolean);
 
 export const WHATSAPP_ENABLED =
   (process.env.WHATSAPP_ENABLED || envConfig.WHATSAPP_ENABLED || '').toLowerCase() === 'true';
@@ -216,6 +247,21 @@ export const SMART_ROUTING_ENABLED =
   (process.env.SMART_ROUTING_ENABLED || envConfig.SMART_ROUTING_ENABLED || 'false').toLowerCase() === 'true';
 export const SMART_ROUTING_CHEAP_MODEL =
   process.env.SMART_ROUTING_CHEAP_MODEL || envConfig.SMART_ROUTING_CHEAP_MODEL || 'claude-haiku-4-5';
+
+// Persistent subprocess pool (v2 sessions). When true and a pool key is
+// provided, reuses a long-lived `claude` subprocess per (chat × cwd × model
+// × mcpset) to eliminate the ~50s cold-start per turn. Falls back to v1
+// `query()` automatically on any failure. Default: false (opt-in, alpha API).
+export const AGENT_USE_V2_SESSIONS =
+  (process.env.AGENT_USE_V2_SESSIONS || envConfig.AGENT_USE_V2_SESSIONS || 'false').toLowerCase() === 'true';
+
+// Mission task timeout (ms). Defaults to 15 minutes. Chat-type missions
+// (with chat_id) and async missions both honor this unless overridden via
+// the per-mission timeout_ms column. Floor of 60s to prevent foot-guns.
+export const MISSION_TIMEOUT_MS = Math.max(
+  60_000,
+  parseInt(process.env.MISSION_TIMEOUT_MS || envConfig.MISSION_TIMEOUT_MS || '900000', 10),
+);
 
 // Cost footer on every response.
 // compact = model only, verbose = model + tokens, cost = model + $, full = everything

@@ -2,26 +2,32 @@
   "main": {
     "voice_id": "a0e99841-438c-4a64-b679-ae501e7d6091",
     "gemini_voice": "Charon",
-    "name": "Charon / British Male (informative, confident)"
+    "xai_voice": "Eve",
+    "name": "Charon / British Male (informative, confident)",
+    "language": null
   },
   "research": {
     "voice_id": "bf991597-6c13-47e4-8411-91ec2de5c466",
     "gemini_voice": "Kore",
-    "name": "Kore / American Female (firm, analytical)"
+    "name": "Kore / American Female (firm, analytical)",
+    "language": null
   },
   "comms": {
     "voice_id": "c2ac25f9-ecc4-4f56-9095-651354df60c0",
     "gemini_voice": "Aoede",
-    "name": "Aoede / American Male (breezy, warm)"
+    "name": "Aoede / American Male (breezy, warm)",
+    "language": null
   },
   "content": {
     "voice_id": "a01c369f-6d2d-4185-bc20-b32c225eab70",
     "gemini_voice": "Leda",
-    "name": "Leda / British Female (youthful, creative)"
+    "name": "Leda / British Female (youthful, creative)",
+    "language": null
   },
   "ops": {
     "voice_id": "2ee87190-8f84-4925-97da-e52547f9462c",
     "gemini_voice": "Alnilam",
-    "name": "Alnilam / American Male (firm, direct)"
+    "name": "Alnilam / American Male (firm, direct)",
+    "language": null
   }
 }
