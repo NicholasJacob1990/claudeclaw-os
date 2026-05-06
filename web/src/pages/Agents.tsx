@@ -377,6 +377,7 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
   const [nameTouched, setNameTouched] = useState(false);
   const [description, setDescription] = useState('');
   const [model, setModel] = useState('claude-sonnet-4-6');
+  const [runtime, setRuntime] = useState<'claude' | 'codex' | 'gemini' | 'openai-sdk' | 'gemini-sdk'>('claude');
   const [template, setTemplate] = useState('');
   const [botToken, setBotToken] = useState('');
   const [createdId, setCreatedId] = useState<string | null>(null);
@@ -403,7 +404,7 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
   // Reset on close.
   function close() {
     setStep(1); setId(''); setName(''); setNameTouched(false); setDescription('');
-    setModel('claude-sonnet-4-6'); setTemplate(''); setBotToken('');
+    setModel('claude-sonnet-4-6'); setRuntime('claude'); setTemplate(''); setBotToken('');
     setCreatedId(null); setCreatedSummary(null); setError(null);
     onClose();
   }
@@ -442,7 +443,7 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
     setCreating(true); setError(null);
     try {
       const res = await apiPost<any>('/api/agents/create', {
-        id, name, description, model, template, botToken,
+        id, name, description, model, runtime, template, botToken,
       });
       setCreatedId(res.agentId);
       setCreatedSummary({ envKey: res.envKey, agentDir: res.agentDir });
@@ -582,10 +583,26 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
                 onChange={(e) => setModel((e.target as HTMLSelectElement).value)}
                 class="w-full bg-[var(--color-elevated)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-[12.5px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
               >
-                <option value="claude-opus-4-6">Opus 4.6</option>
-                <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-                <option value="claude-sonnet-4-5">Sonnet 4.5</option>
-                <option value="claude-haiku-4-5">Haiku 4.5</option>
+                <optgroup label="Claude (SDK · skills/MCPs ~/.claude)">
+                  <option value="claude-opus-4-7">Opus 4.7</option>
+                  <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+                  <option value="claude-sonnet-4-5">Sonnet 4.5</option>
+                  <option value="claude-haiku-4-5">Haiku 4.5</option>
+                </optgroup>
+                <optgroup label="OpenAI (Codex CLI ou openai-sdk)">
+                  <option value="gpt-5.5">GPT-5.5</option>
+                  <option value="gpt-5.2">GPT-5.2</option>
+                  <option value="gpt-4.1">GPT-4.1</option>
+                </optgroup>
+                <optgroup label="Gemini (Gemini CLI ou gemini-sdk)">
+                  <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
+                  <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+                  <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite</option>
+                  <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image</option>
+                  <option value="gemini-3.1-flash-image-preview">Gemini 3.1 Flash Image</option>
+                  <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                  <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                </optgroup>
               </select>
             </Field>
             <Field label="Template">
@@ -598,6 +615,22 @@ function CreateAgentWizard({ open, onClose, onCreated, prefill }: CreateAgentWiz
                 {templates.data?.templates?.filter((t) => t.id !== '_template').map((t) => (
                   <option key={t.id} value={t.id}>{t.name}</option>
                 ))}
+              </select>
+            </Field>
+          </div>
+
+          <div class="grid grid-cols-1 gap-3 mt-3">
+            <Field label="Runtime backend" hint="Stack que executa o agente. CLI carrega skills locais; SDK dá hosted tools.">
+              <select
+                value={runtime}
+                onChange={(e) => setRuntime((e.target as HTMLSelectElement).value)}
+                class="w-full bg-[var(--color-elevated)] border border-[var(--color-border)] rounded px-2.5 py-1.5 text-[12.5px] text-[var(--color-text)] outline-none focus:border-[var(--color-accent)]"
+              >
+                <option value="claude">Claude SDK · skills/MCPs ~/.claude</option>
+                <option value="codex">Codex CLI · ~/.codex AGENTS.md + MCPs</option>
+                <option value="gemini">Gemini CLI · ~/.gemini extensions</option>
+                <option value="openai-sdk">OpenAI SDK · web_search + file_search + code_interpreter</option>
+                <option value="gemini-sdk">Gemini SDK · grounding + code_execution + thinking</option>
               </select>
             </Field>
           </div>
