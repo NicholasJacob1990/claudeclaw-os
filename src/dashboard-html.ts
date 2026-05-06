@@ -1618,14 +1618,19 @@ async function loadAgents() {
       const modelOpts = [
         'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5',
         'gpt-5.5', 'gpt-5.2', 'gpt-4.1',
-        'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
+        'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview',
+        'gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview',
         'gemini-2.5-pro', 'gemini-2.5-flash',
       ];
       const modelShort = function(m) {
         return {
           'claude-opus-4-7':'Opus','claude-sonnet-4-6':'Sonnet','claude-sonnet-4-5':'Sonnet 4.5','claude-haiku-4-5':'Haiku',
           'gpt-5.5':'GPT-5.5','gpt-5.2':'GPT-5.2','gpt-4.1':'GPT-4.1',
-          'gemini-3.1-pro-preview':'Gemini 3.1 Pro','gemini-3-flash-preview':'Gemini 3 Flash',
+          'gemini-3.1-pro-preview':'Gemini 3.1 Pro',
+          'gemini-3-flash-preview':'Gemini 3 Flash',
+          'gemini-3.1-flash-lite-preview':'Gemini 3.1 Flash Lite',
+          'gemini-3-pro-image-preview':'Gemini 3 Pro Image',
+          'gemini-3.1-flash-image-preview':'Gemini 3.1 Flash Image',
           'gemini-2.5-pro':'Gemini 2.5 Pro','gemini-2.5-flash':'Gemini 2.5 Flash',
         }[m] || m;
       };
