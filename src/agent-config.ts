@@ -182,6 +182,25 @@ export function setAgentModel(agentId: string, model: string): void {
   fs.writeFileSync(configPath, yaml.dump(raw, { lineWidth: -1 }), 'utf-8');
 }
 
+/** Persist `runtime:` field in agent.yaml. Validates against the AgentRuntime
+ *  union before writing so a typo via PATCH endpoint can't sneak invalid
+ *  state into the YAML (loadAgentConfig would just warn + fallback to claude
+ *  if it did, but we'd still have garbage on disk).
+ */
+export function setAgentRuntime(agentId: string, runtime: AgentRuntime): void {
+  const VALID = new Set<AgentRuntime>(['claude', 'codex', 'gemini', 'openai-sdk', 'gemini-sdk']);
+  if (!VALID.has(runtime)) {
+    throw new Error(`Invalid runtime "${runtime}". Valid: ${[...VALID].join(', ')}`);
+  }
+  const agentDir = resolveAgentDir(agentId);
+  const configPath = path.join(agentDir, 'agent.yaml');
+  if (!fs.existsSync(configPath)) throw new Error(`Agent config not found: ${configPath}`);
+
+  const raw = yaml.load(fs.readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+  raw['runtime'] = runtime;
+  fs.writeFileSync(configPath, yaml.dump(raw, { lineWidth: -1 }), 'utf-8');
+}
+
 /** List all configured agent IDs (directories under agents/ with agent.yaml).
  *  Scans both CLAUDECLAW_CONFIG/agents/ and PROJECT_ROOT/agents/, deduplicating.
  */

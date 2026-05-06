@@ -1619,6 +1619,21 @@ async function loadAgents() {
           modelOpts.map(m => '<div class="model-opt' + (currentModel === m ? ' model-active' : '') + '" data-model="' + m + '" onclick="pickModel(this)">' + modelShort(m) + '</div>').join('') +
         '</div>' +
       '</div>';
+      // Runtime picker — same UX as model-picker. 5 options:
+      //   claude (SDK)  | codex (CLI)  | gemini (CLI)
+      //   openai-sdk    | gemini-sdk
+      // CLI runtimes load skills/MCPs from ~/.<cli>/; SDK runtimes give
+      // hosted tools (web_search, file_search, code_interpreter, grounding).
+      const runtimeOpts = ['claude', 'codex', 'gemini', 'openai-sdk', 'gemini-sdk'];
+      const runtimeShort = function(r) { return {'claude':'Claude SDK','codex':'Codex CLI','gemini':'Gemini CLI','openai-sdk':'OpenAI SDK','gemini-sdk':'Gemini SDK'}[r] || r; };
+      const currentRuntime = a.runtime || 'claude';
+      const runtimeLabel = runtimeShort(currentRuntime);
+      const runtimeSelect = '<div class="model-picker runtime-picker" data-agent="' + a.id + '" onclick="event.stopPropagation();toggleModelPicker(this)" title="Backend runtime — claude (SDK) | codex/gemini (CLI) | openai-sdk/gemini-sdk (hosted tools)">' +
+        '<span class="model-current">' + runtimeLabel + ' <span style="font-size:8px;opacity:0.5">&#9662;</span></span>' +
+        '<div class="model-menu" style="display:none">' +
+          runtimeOpts.map(r => '<div class="model-opt' + (currentRuntime === r ? ' model-active' : '') + '" data-runtime="' + r + '" onclick="pickRuntime(this)">' + runtimeShort(r) + '</div>').join('') +
+        '</div>' +
+      '</div>';
       // Unified avatar endpoint: serves user uploads, Telegram-cached
       // photos, or bundled fallback art from a single resolver. The
       // onerror fallback removes the <img> if even the resolver 204s
@@ -1635,6 +1650,7 @@ async function loadAgents() {
             '<div class="font-bold text-white text-sm">' + a.name + '</div>' +
             '<div class="text-xs mt-1">' + dot + ' ' + statusText + '</div>' +
             modelSelect +
+            runtimeSelect +
             (a.running ? '<div class="text-xs text-gray-400 mt-1">' + a.todayTurns + ' turns</div>' : '') +
           '</div>' +
         '</div>' +
@@ -1677,6 +1693,36 @@ async function pickGlobalModel(optEl) {
     });
     await loadAgents();
   } catch(e) { console.error('Global model update failed:', e); }
+}
+
+// Runtime picker handler — paralelo ao pickModel mas dispatcha pra
+// /api/agents/:id/runtime. Backend valida contra AgentRuntime union;
+// next runAgent call (Telegram, scheduler, mission) ramifica
+// automaticamente pro runtime escolhido sem precisar restart pra Main.
+async function pickRuntime(optEl) {
+  var runtime = optEl.dataset.runtime;
+  var picker = optEl.closest('.model-picker');
+  var agentId = picker.dataset.agent;
+  picker.querySelector('.model-menu').style.display = 'none';
+  try {
+    var res = await fetch(BASE + '/api/agents/' + agentId + '/runtime?token=' + TOKEN, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runtime: runtime }),
+    });
+    var data = await res.json().catch(function() { return {}; });
+    if (data && data.ok) {
+      await loadAgents();
+      // Sub-agents need restart pra release o que carregaram em memória
+      // (loadAgentConfig é chamado a cada runAgent pra Main, mas sub-agents
+      // têm processo separado). Surface o requirement.
+      if (data.restartRequired) {
+        console.info('[runtime] sub-agent ' + agentId + ' needs restart pra picking up runtime=' + runtime);
+      }
+    } else {
+      console.error('Runtime update failed:', data && data.error);
+    }
+  } catch(e) { console.error('Runtime update failed:', e); }
 }
 
 // Close model menus when clicking outside

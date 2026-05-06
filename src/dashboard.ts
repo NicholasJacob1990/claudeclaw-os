@@ -68,7 +68,7 @@ import {
 import { computeNextRun } from './scheduler.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { getSecurityStatus } from './security.js';
-import { AGENT_ID_RE, agentExists, listAgentIds, loadAgentConfig, resolveAgentDir, setAgentModel } from './agent-config.js';
+import { AGENT_ID_RE, agentExists, listAgentIds, loadAgentConfig, resolveAgentDir, setAgentModel, setAgentRuntime, type AgentRuntime } from './agent-config.js';
 import {
   resolveAgentAvatar,
   avatarEtag,
@@ -2026,6 +2026,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
           name: config.name,
           description: config.description,
           model: mainOverride ?? config.model ?? 'claude-opus-4-7',
+          runtime: config.runtime ?? 'claude',
           running,
           todayTurns: stats.todayTurns,
           todayCost: stats.todayCost,
@@ -2035,7 +2036,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
           avatar_etag: avatarEtagForId(id),
         };
       } catch {
-        return { id, name: id, description: '', model: 'unknown', running: false, todayTurns: 0, todayCost: 0, avatar_etag: avatarEtagForId(id) };
+        return { id, name: id, description: '', model: 'unknown', runtime: 'claude', running: false, todayTurns: 0, todayCost: 0, avatar_etag: avatarEtagForId(id) };
       }
     });
 
@@ -2049,8 +2050,11 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       } catch { /* not running */ }
     }
     const mainStats = getAgentTokenStats('main');
+    // Main has no agent.yaml; default runtime claude. If main ever gets one
+    // (e.g. user wants main on codex CLI), this should switch to loadAgentConfig.
+    const mainRuntime = 'claude' as const;
     const allAgents = [
-      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-7', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
+      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-7', runtime: mainRuntime, running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
       ...agents,
     ];
 
@@ -2078,6 +2082,53 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const agentId = c.req.param('id');
     const stats = getAgentTokenStats(agentId);
     return c.json(stats);
+  });
+
+  // ── Runtime backend ─────────────────────────────────────────────────
+  // Per-agent runtime selection: claude (SDK) | codex (CLI) | gemini (CLI)
+  // | openai-sdk (@openai/agents) | gemini-sdk (@google/genai). Same first-
+  // win route gotcha as /model: bulk endpoint registered BEFORE the :id one.
+  const VALID_RUNTIMES: readonly AgentRuntime[] = ['claude', 'codex', 'gemini', 'openai-sdk', 'gemini-sdk'];
+
+  app.patch('/api/agents/runtime', async (c) => {
+    const body = await c.req.json<{ runtime?: string }>();
+    const runtime = body?.runtime?.trim() as AgentRuntime | undefined;
+    if (!runtime || !VALID_RUNTIMES.includes(runtime)) {
+      return c.json({ error: `Invalid runtime. Valid: ${VALID_RUNTIMES.join(', ')}` }, 400);
+    }
+    const agentIds = listAgentIds();
+    const updated: string[] = [];
+    const restartRequired: string[] = [];
+    for (const id of agentIds) {
+      try {
+        setAgentRuntime(id, runtime);
+        updated.push(id);
+        // Runtime field is read on agent process startup; sub-agents need
+        // restart to pick up the new path. Same UX as model bulk update.
+        if (id !== 'main') restartRequired.push(id);
+      } catch { /* skip ids without yaml */ }
+    }
+    return c.json({ ok: true, runtime, updated, restartRequired });
+  });
+
+  app.patch('/api/agents/:id/runtime', async (c) => {
+    const agentId = c.req.param('id');
+    const body = await c.req.json<{ runtime?: string }>();
+    const runtime = body?.runtime?.trim() as AgentRuntime | undefined;
+    if (!runtime || !VALID_RUNTIMES.includes(runtime)) {
+      return c.json({ error: `Invalid runtime. Valid: ${VALID_RUNTIMES.join(', ')}` }, 400);
+    }
+    try {
+      setAgentRuntime(agentId, runtime);
+      // Main reads runtime via loadAgentConfig at every runAgent call (no
+      // cache), so it picks up the change on the next turn — no restart
+      // needed. Sub-agents would need the .yaml re-read on next process
+      // boot, hence restartRequired flag for clarity in the UI.
+      return c.json({ ok: true, agent: agentId, runtime, restartRequired: agentId !== 'main' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to update runtime';
+      return c.json({ error: msg }, 500);
+    }
   });
 
   // Update ALL agent models at once. MUST be registered before the
