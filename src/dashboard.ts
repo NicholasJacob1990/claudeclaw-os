@@ -1387,8 +1387,14 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // listing what's missing. Skipped (returns null) if `mixed` or empty.
   // Runs Python with `-c "import a; import b"` so a single failing dep
   // doesn't mask later ones — the first ImportError aborts and gets
-  // surfaced. Timeout is short (2s) because cold-import a module from
-  // disk is ~150ms; anything slower means something else is wrong.
+  // surfaced. Timeout is 10s because pipecat itself takes ~2-4s cold
+  // (it pre-loads google-genai + transformers + tokenizers), and that's
+  // before any provider-specific imports. Measured on this machine:
+  //   pipecat.services.google.gemini_live.llm  3784ms
+  //   pipecat.services.xai.realtime.llm        1581ms
+  //   mistralai                                  34ms
+  // Bumping to 10s gives 2.5× headroom on the slowest module without
+  // making a missing-dep error wait too long for the user.
   async function probeProviderDeps(provider: string): Promise<string | null> {
     const deps = PROVIDER_DEPS[provider];
     if (!deps || deps.length === 0) return null;
@@ -1403,8 +1409,8 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         cp.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
         const timer = setTimeout(() => {
           try { cp.kill('SIGKILL'); } catch { /* noop */ }
-          resolve(`probe timed out (>2s) for ${provider}`);
-        }, 2000);
+          resolve(`probe timed out (>10s) for ${provider} — pipecat may be re-installing or venv is corrupt`);
+        }, 10000);
         cp.on('exit', (code) => {
           clearTimeout(timer);
           if (code === 0) return resolve(null);
