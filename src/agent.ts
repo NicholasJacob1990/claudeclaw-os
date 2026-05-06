@@ -3,13 +3,15 @@ import path from 'path';
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
-import { AGENT_MAX_TURNS, AGENT_USE_V2_SESSIONS, PROJECT_ROOT, agentCwd } from './config.js';
+import { AGENT_ID, AGENT_MAX_TURNS, AGENT_USE_V2_SESSIONS, PROJECT_ROOT, agentCwd } from './config.js';
 import { readEnvFile } from './env.js';
 import { classifyError, AgentError } from './errors.js';
 import { logger } from './logger.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { requireEnabled } from './kill-switches.js';
 import { runPooledTurn, sessionPoolKey } from './claude-session-pool.js';
+import { loadAgentConfig } from './agent-config.js';
+import { runNonClaudeRuntime } from './agent-runtimes.js';
 
 // ── MCP server loading ──────────────────────────────────────────────
 // The Agent SDK's settingSources loads CLAUDE.md and permissions from
@@ -191,6 +193,38 @@ export async function runAgent(
   // path that ends up here; the war-room and voice paths have their own
   // requireEnabled calls at their own SDK boundaries.
   requireEnabled('LLM_SPAWN_ENABLED');
+
+  // ── Runtime branching ────────────────────────────────────────────────
+  // Per-agent runtime selection. agent.yaml `runtime: codex|gemini` shells
+  // out to the corresponding CLI; default 'claude' keeps the SDK path
+  // below. CLIs auto-load their own skills/MCPs/extensions from $HOME so
+  // we don't replicate tool dispatch here. Skips claude-only optimizations
+  // (v2 sessions pool, in-process MCP) — codex/gemini paths are simpler
+  // single-shot subprocess calls.
+  try {
+    const cfg = loadAgentConfig(AGENT_ID);
+    const runtime = cfg.runtime ?? 'claude';
+    if (runtime === 'codex' || runtime === 'gemini') {
+      const cliEnv = readEnvFile([
+        'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY',
+        'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
+      ]);
+      const cliSdkEnv = { ...process.env, ...cliEnv };
+      logger.info({ runtime, agentId: AGENT_ID }, 'Routing to non-Claude runtime');
+      return runNonClaudeRuntime(runtime, {
+        message,
+        cwd: agentCwd ?? PROJECT_ROOT,
+        env: cliSdkEnv,
+        abortController,
+        onStreamText,
+      });
+    }
+  } catch (err) {
+    // If config doesn't load (main agent has no agent.yaml), fall through
+    // to default Claude SDK path. Don't fail the request just because the
+    // runtime field couldn't be read.
+    logger.debug({ err: err instanceof Error ? err.message : String(err) }, 'No per-agent config; using Claude default');
+  }
 
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/

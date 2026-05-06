@@ -33,11 +33,19 @@ export function agentExists(agentId: string): boolean {
   }
 }
 
+export type AgentRuntime = 'claude' | 'codex' | 'gemini';
+
 export interface AgentConfig {
   name: string;
   description: string;
   botTokenEnv: string;
   botToken: string;
+  /** Runtime backend that powers this agent. 'claude' uses the Claude Code
+   *  Agent SDK (default, full skills + MCPs). 'codex' shells out to the
+   *  Codex CLI. 'gemini' shells out to the Gemini CLI. CLIs auto-load their
+   *  own skills/extensions/MCPs from ~/.codex and ~/.gemini respectively.
+   *  Set in agent.yaml as `runtime: <claude|codex|gemini>`. */
+  runtime?: AgentRuntime;
   model?: string;
   mcpServers?: string[];
   /** Per-agent war-room tool allowlist. Tokens are SDK tool names
@@ -100,6 +108,17 @@ export function loadAgentConfig(agentId: string): AgentConfig {
   const description = (raw['description'] as string) ?? '';
   const botTokenEnv = raw['telegram_bot_token_env'] as string;
   const model = raw['model'] as string | undefined;
+  // Runtime field (claude|codex|gemini) — defaults to 'claude' for backward
+  // compat. Anything else is rejected so typos don't silently fall through.
+  const rawRuntime = (raw['runtime'] as string | undefined)?.toLowerCase();
+  const runtime: AgentRuntime | undefined =
+    rawRuntime === 'codex' || rawRuntime === 'gemini' || rawRuntime === 'claude'
+      ? rawRuntime
+      : undefined;
+  if (rawRuntime && !runtime) {
+    // eslint-disable-next-line no-console
+    console.warn(`[${agentId}] Unknown runtime "${rawRuntime}". Falling back to 'claude'.`);
+  }
 
   if (!name || !botTokenEnv) {
     throw new Error(`Agent config ${configPath} must have 'name' and 'telegram_bot_token_env'`);
@@ -141,6 +160,7 @@ export function loadAgentConfig(agentId: string): AgentConfig {
     description,
     botTokenEnv,
     botToken,
+    runtime,
     model,
     mcpServers,
     warroomTools,

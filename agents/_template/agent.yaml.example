@@ -14,8 +14,19 @@ description: What this agent does
 # Create a bot via @BotFather in Telegram, paste the token into .env.
 telegram_bot_token_env: MYAGENT_BOT_TOKEN
 
-# Default model. Options: claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5
-# Users can override per-chat with /model in Telegram.
+# Runtime backend. Choose which CLI/SDK powers this agent:
+#   claude (default) — Claude Code Agent SDK; full skills + MCPs from ~/.claude/
+#   codex            — Codex CLI (OpenAI); auto-loads ~/.codex/AGENTS.md + skills
+#   gemini           — Gemini CLI (Google); auto-loads ~/.gemini/extensions
+# Each runtime brings its own tool/skill stack from $HOME, so install the
+# CLIs you want before pointing an agent at them.
+runtime: claude
+
+# Default model. Options:
+#   claude-* — claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5
+#   codex    — model alias is set in ~/.codex/config.toml; this field unused
+#   gemini   — model selection via ~/.gemini settings; this field unused
+# Users can override per-chat with /model in Telegram (claude only).
 model: claude-sonnet-4-6
 
 # Obsidian integration (optional).
