@@ -1360,6 +1360,71 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     return c.json({ ok: true, ...readProviderState() });
   });
 
+  // Provider → list of Python module names that the warroom subprocess
+  // would `import` if pinned to it. Used by the readiness check below
+  // so the dashboard rejects a provider the local venv can't actually
+  // start (instead of accepting, killing, and crashloop on respawn).
+  //
+  // Pipecat's stable providers (gemini-live*, cartesia, voxtral via
+  // mistralai) are listed; xai is via pipecat-ai[xai] extra. For
+  // `mixed` we don't list anything — it picks per-agent at runtime
+  // and a partial install still works (the agent that needs the
+  // missing dep just falls back to the stack default).
+  const PROVIDER_DEPS: Record<string, string[]> = {
+    'gemini-live':    ['pipecat.services.google.gemini_live.llm'],
+    'gemini-live-25': ['pipecat.services.google.gemini_live.llm'],
+    'xai':            ['pipecat.services.xai.realtime.llm'],
+    'groq':           ['pipecat.services.groq.stt', 'pipecat.services.groq.tts'],
+    'cartesia':       ['pipecat.services.cartesia.tts'],
+    'elevenlabs':     ['pipecat.services.elevenlabs.tts', 'pipecat.services.groq.stt'],
+    'voxtral':        ['mistralai'],
+    // 'mixed' has no hard deps — it's a router that picks per-agent at runtime
+    'mixed':          [],
+  };
+
+  // Cheap probe that asks the warroom venv whether it can `import` each
+  // dep. Returns null if everything imports, or a human-readable error
+  // listing what's missing. Skipped (returns null) if `mixed` or empty.
+  // Runs Python with `-c "import a; import b"` so a single failing dep
+  // doesn't mask later ones — the first ImportError aborts and gets
+  // surfaced. Timeout is short (2s) because cold-import a module from
+  // disk is ~150ms; anything slower means something else is wrong.
+  async function probeProviderDeps(provider: string): Promise<string | null> {
+    const deps = PROVIDER_DEPS[provider];
+    if (!deps || deps.length === 0) return null;
+    const venvPython = path.join(PROJECT_ROOT, 'warroom', '.venv', 'bin', 'python');
+    const py = fs.existsSync(venvPython) ? venvPython : 'python3';
+    const code = deps.map((m) => `import ${m}`).join('; ');
+    const { spawn } = await import('child_process');
+    return new Promise((resolve) => {
+      try {
+        const cp = spawn(py, ['-c', code], { stdio: ['ignore', 'ignore', 'pipe'] });
+        let stderr = '';
+        cp.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+        const timer = setTimeout(() => {
+          try { cp.kill('SIGKILL'); } catch { /* noop */ }
+          resolve(`probe timed out (>2s) for ${provider}`);
+        }, 2000);
+        cp.on('exit', (code) => {
+          clearTimeout(timer);
+          if (code === 0) return resolve(null);
+          // Extract the ModuleNotFoundError module name if present so the
+          // error message tells the user exactly which `pip install ...`
+          // would unblock them.
+          const m = stderr.match(/No module named ['"]([^'"]+)['"]/);
+          const missing = m ? m[1] : 'unknown module';
+          resolve(`provider ${provider} requires '${missing}' (run: warroom/.venv/bin/pip install -r warroom/requirements.txt)`);
+        });
+        cp.on('error', (err) => {
+          clearTimeout(timer);
+          resolve(`could not spawn python probe: ${err.message}`);
+        });
+      } catch (err) {
+        resolve(`probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+  }
+
   app.post('/api/warroom/provider', async (c) => {
     let body: { provider?: string | null; restart?: boolean } = {};
     try { body = await c.req.json(); } catch { /* empty body */ }
@@ -1367,6 +1432,19 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const p = body.provider;
     if (p !== null && p !== '' && p !== undefined && !VALID_PROVIDERS.has(p)) {
       return c.json({ ok: false, error: `invalid provider; must be one of ${[...VALID_PROVIDERS].join(', ')} or null` }, 400);
+    }
+
+    // Readiness check: if the user is pinning a real provider, verify
+    // the warroom venv can actually start it before we kill the running
+    // subprocess. Without this, switching to e.g. 'voxtral' on a venv
+    // that lacks `mistralai` quietly accepts the change, kills the
+    // server, and leaves the user with a broken war room until they
+    // notice the import error in /tmp/warroom-debug.log.
+    if (p && p !== '' && PROVIDER_DEPS[p] !== undefined) {
+      const missing = await probeProviderDeps(p);
+      if (missing) {
+        return c.json({ ok: false, error: missing }, 400);
+      }
     }
 
     try {

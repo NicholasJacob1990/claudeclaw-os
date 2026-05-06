@@ -1,2 +1,13 @@
-pipecat-ai[websocket,deepgram,cartesia,silero]==0.0.108
+pipecat-ai[websocket,deepgram,cartesia,silero,groq,elevenlabs,google,xai]==0.0.108
 python-dotenv>=1.0.0
+
+# Mistral SDK is required by the `voxtral` provider for realtime
+# transcription and TTS via /v1/audio/speech. Pulled in directly
+# because pipecat-ai does not ship a `voxtral` extra.
+mistralai>=2.4
+
+# Pulled in transitively by pipecat extras above, but pinned
+# explicitly so a future pipecat upgrade doesn't silently break a
+# provider mode the dashboard might pin.
+groq>=1.2
+elevenlabs>=1.0
