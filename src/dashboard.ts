@@ -2705,6 +2705,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       name?: string;
       description?: string;
       model?: string;
+      runtime?: string;
       template?: string;
       botToken?: string;
     }>();
@@ -2713,6 +2714,11 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const name = body?.name?.trim();
     const description = body?.description?.trim();
     const botToken = body?.botToken?.trim();
+    const VALID_RUNTIMES_CREATE: AgentRuntime[] = ['claude', 'codex', 'gemini', 'openai-sdk', 'gemini-sdk'];
+    const runtimeRaw = body?.runtime?.trim();
+    const runtime = runtimeRaw && VALID_RUNTIMES_CREATE.includes(runtimeRaw as AgentRuntime)
+      ? (runtimeRaw as AgentRuntime)
+      : undefined;
 
     if (!id) return c.json({ error: 'id required' }, 400);
     if (!name) return c.json({ error: 'name required' }, 400);
@@ -2725,6 +2731,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         name,
         description,
         model: body?.model?.trim() || undefined,
+        runtime,
         template: body?.template?.trim() || undefined,
         botToken,
       });

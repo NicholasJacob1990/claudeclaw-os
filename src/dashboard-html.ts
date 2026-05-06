@@ -440,15 +440,45 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
         <div style="flex:1">
           <label class="text-xs text-gray-400 block mb-1">Model</label>
           <select id="caw-model" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none">
-            <option value="claude-sonnet-4-6" selected>Sonnet 4.6</option>
-            <option value="claude-opus-4-7">Opus 4.7</option>
-            <option value="claude-haiku-4-5">Haiku 4.5</option>
+            <optgroup label="Claude (SDK · skills + MCPs ~/.claude)">
+              <option value="claude-opus-4-7">Opus 4.7</option>
+              <option value="claude-sonnet-4-6" selected>Sonnet 4.6</option>
+              <option value="claude-sonnet-4-5">Sonnet 4.5</option>
+              <option value="claude-haiku-4-5">Haiku 4.5</option>
+            </optgroup>
+            <optgroup label="OpenAI (Codex CLI ou openai-sdk)">
+              <option value="gpt-5.5">GPT-5.5</option>
+              <option value="gpt-5.2">GPT-5.2</option>
+              <option value="gpt-4.1">GPT-4.1</option>
+            </optgroup>
+            <optgroup label="Gemini (Gemini CLI ou gemini-sdk)">
+              <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
+              <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+              <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash Lite</option>
+              <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image</option>
+              <option value="gemini-3.1-flash-image-preview">Gemini 3.1 Flash Image</option>
+              <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+              <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+            </optgroup>
           </select>
         </div>
         <div style="flex:1">
           <label class="text-xs text-gray-400 block mb-1">Template</label>
           <select id="caw-template" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none">
             <option value="_template">Blank</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="flex gap-2 mb-3">
+        <div style="flex:1">
+          <label class="text-xs text-gray-400 block mb-1">Runtime backend</label>
+          <select id="caw-runtime" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none" title="Stack que executa o agente. CLI carrega skills locais; SDK dá hosted tools.">
+            <option value="claude" selected>Claude SDK · skills/MCPs ~/.claude</option>
+            <option value="codex">Codex CLI · ~/.codex AGENTS.md + MCPs</option>
+            <option value="gemini">Gemini CLI · ~/.gemini extensions</option>
+            <option value="openai-sdk">OpenAI SDK · web_search + file_search + code_interpreter</option>
+            <option value="gemini-sdk">Gemini SDK · grounding + code_execution + thinking</option>
           </select>
         </div>
       </div>
@@ -1927,6 +1957,7 @@ function openCreateAgentWizard() {
   document.getElementById('caw-name').value = '';
   document.getElementById('caw-desc').value = '';
   document.getElementById('caw-model').value = 'claude-sonnet-4-6';
+  document.getElementById('caw-runtime').value = 'claude';
   document.getElementById('caw-token').value = '';
   document.getElementById('caw-id-status').innerHTML = '';
   document.getElementById('caw-token-status').innerHTML = '';
@@ -2107,6 +2138,7 @@ async function cawCreate() {
         name: document.getElementById('caw-name').value.trim(),
         description: document.getElementById('caw-desc').value.trim(),
         model: document.getElementById('caw-model').value,
+        runtime: document.getElementById('caw-runtime').value,
         template: document.getElementById('caw-template').value,
         botToken: document.getElementById('caw-token').value.trim(),
       }),

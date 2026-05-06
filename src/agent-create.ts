@@ -114,6 +114,9 @@ export interface CreateAgentOpts {
   name: string;
   description: string;
   model?: string;
+  /** Runtime backend: claude (SDK, default) | codex (CLI) | gemini (CLI)
+   *  | openai-sdk | gemini-sdk. Persisted as `runtime:` em agent.yaml. */
+  runtime?: 'claude' | 'codex' | 'gemini' | 'openai-sdk' | 'gemini-sdk';
   template?: string;
   botToken: string;
 }
@@ -226,7 +229,7 @@ export function listTemplates(): AgentTemplate[] {
 // ── Create ───────────────────────────────────────────────────────────
 
 export async function createAgent(opts: CreateAgentOpts): Promise<CreateAgentResult> {
-  const { id, name, description, model, template, botToken } = opts;
+  const { id, name, description, model, runtime, template, botToken } = opts;
 
   // Validate ID
   const idCheck = validateAgentId(id);
@@ -299,6 +302,7 @@ export async function createAgent(opts: CreateAgentOpts): Promise<CreateAgentRes
     name,
     description,
     telegram_bot_token_env: envKey,
+    runtime: runtime || 'claude',
     model: model || 'claude-sonnet-4-6',
   };
   fs.writeFileSync(
