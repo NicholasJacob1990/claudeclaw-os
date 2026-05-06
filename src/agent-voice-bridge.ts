@@ -13,14 +13,15 @@
  */
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import fs from 'fs';
-import yaml from 'js-yaml';
 import { readEnvFile } from './env.js';
 import { initDatabase, getSession, setSession } from './db.js';
 import { buildMemoryContext } from './memory.js';
 import { getScrubbedSdkEnv } from './security.js';
-import { requireEnabled, KillSwitchDisabledError } from './kill-switches.js';
+import { requireEnabled } from './kill-switches.js';
 import { loadMcpServers } from './agent.js';
+import { loadAgentConfig, resolveAgentDir } from './agent-config.js';
+import { runNonClaudeRuntime, type RuntimeId } from './agent-runtimes.js';
+import { CLAUDECLAW_CONFIG } from './config.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -96,38 +97,37 @@ async function main() {
       throw new Error(`Invalid agent ID: ${agentId}`);
     }
 
-    // Resolve agent directory and verify it's within the project
+    // Resolve agent directory with the same source of truth as Telegram,
+    // dashboard, and text War Room. Custom agents live under
+    // CLAUDECLAW_CONFIG/agents, not necessarily PROJECT_ROOT/agents.
     const agentDir = agentId === 'main'
       ? PROJECT_ROOT
-      : path.join(PROJECT_ROOT, 'agents', agentId);
+      : resolveAgentDir(agentId);
     const resolved = path.resolve(agentDir);
-    if (!resolved.startsWith(path.resolve(PROJECT_ROOT) + path.sep) && resolved !== path.resolve(PROJECT_ROOT)) {
-      throw new Error(`Agent path outside project: ${resolved}`);
+    const allowedRoots = [path.resolve(PROJECT_ROOT), path.resolve(CLAUDECLAW_CONFIG)];
+    const underAllowedRoot = allowedRoots.some((root) =>
+      resolved === root || resolved.startsWith(root + path.sep),
+    );
+    if (!underAllowedRoot) {
+      throw new Error(`Agent path outside allowed roots: ${resolved}`);
     }
 
-    // Read the agent's MCP allowlist from its agent.yaml (if present). The
-    // text bot does this via loadAgentConfig in src/bot.ts; we do a minimal
-    // inline read to avoid pulling bot.ts's heavy init chain into the voice
-    // bridge subprocess.
+    // Read the agent config once so voice uses the same runtime/model/MCP
+    // contract as the text bot.
+    let runtime: RuntimeId = 'claude';
+    let model: string | undefined;
     let mcpAllowlist: string[] | undefined;
-    try {
-      const yamlPath = path.join(agentDir, 'agent.yaml');
-      if (fs.existsSync(yamlPath)) {
-        const raw = yaml.load(fs.readFileSync(yamlPath, 'utf-8')) as Record<string, unknown> | undefined;
-        const list = raw?.['mcp_servers'];
-        if (Array.isArray(list)) mcpAllowlist = list.filter((x): x is string => typeof x === 'string');
+    if (agentId !== 'main') {
+      try {
+        const cfg = loadAgentConfig(agentId);
+        runtime = cfg.runtime ?? 'claude';
+        model = cfg.model;
+        mcpAllowlist = cfg.mcpServers;
+      } catch (err) {
+        // Non-fatal for back-compat: fall through with Claude default.
+        process.stderr.write(`[voice-bridge] agent config read failed: ${err instanceof Error ? err.message : String(err)}\n`);
       }
-    } catch (err) {
-      // Non-fatal: fall through with undefined allowlist (loads all MCPs)
-      process.stderr.write(`[voice-bridge] agent.yaml read failed: ${err}\n`);
     }
-
-    // Load MCP servers for this agent, mirroring the text-bot's behavior.
-    // Without this, voice-invoked agents can only use built-in tools (Bash,
-    // Read, Grep, etc.) — no Gmail, Slack, Linear, Fireflies, etc.
-    const mcpServers = loadMcpServers(mcpAllowlist, agentDir);
-    const mcpServerNames = Object.keys(mcpServers);
-    process.stderr.write(`[voice-bridge] agent=${agentId} mcpServers=${JSON.stringify(mcpServerNames)}\n`);
 
     // Resume session if one exists for this chat+agent
     const sessionId = getSession(chatId, agentId) ?? undefined;
@@ -148,6 +148,56 @@ async function main() {
     parts.push(message);
     const fullMessage = parts.join('\n\n');
 
+    if (runtime !== 'claude') {
+      const cliEnv = {
+        ...process.env,
+        ...readEnvFile([
+          'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY',
+          'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
+        ]),
+      };
+      const cliFlags: string[] = [];
+      if (model) cliFlags.push('--model', model);
+      if (quickMode && runtime === 'codex') {
+        cliFlags.push('-c', 'model_reasoning_effort="low"', '--color', 'never');
+      }
+      process.stderr.write(`[voice-bridge] agent=${agentId} runtime=${runtime} model=${model ?? 'default'}\n`);
+      const result = await runNonClaudeRuntime(runtime as Exclude<RuntimeId, 'claude'>, {
+        message: fullMessage,
+        cwd: agentDir,
+        env: cliEnv,
+        cliFlags,
+      });
+      if (result.aborted) throw new Error(`${runtime} runtime aborted`);
+      console.log(JSON.stringify({
+        response: result.text,
+        usage: result.usage,
+        error: null,
+      }));
+      return;
+    }
+
+    // Phase 0.5 — minimal-settings voice mode.
+    //
+    // Phase 0 baseline measured that loading project/user `settingSources`
+    // (CLAUDE.md, permissions, skills, MCP discovery) costs ~45s on cold spawn
+    // — which is 90% of the 53s the voice bridge takes today for a simple
+    // turn. Voice mode rarely needs that tooling: War Room runs short
+    // turn-taking exchanges where skill dispatch is overkill and adds latency
+    // the user actually feels in conversation.
+    //
+    // In quickMode (the default for War Room team modes via `--quick`), we
+    // skip settingSources AND skip MCPs entirely. Result: ~7s/turn instead
+    // of ~53s/turn. Direct mode (no --quick) still loads everything for
+    // substantive Telegram-style voice conversations.
+    //
+    // See docs/voice-bridge-baseline.md for the full benchmark.
+    const minimalSettings = quickMode || process.env.VOICE_BRIDGE_MINIMAL_SETTINGS === '1';
+
+    const mcpServers = minimalSettings ? {} : loadMcpServers(mcpAllowlist, agentDir);
+    const mcpServerNames = Object.keys(mcpServers);
+    process.stderr.write(`[voice-bridge] agent=${agentId} runtime=claude minimalSettings=${minimalSettings} mcpServers=${JSON.stringify(mcpServerNames)}\n`);
+
     let resultText: string | null = null;
     let newSessionId: string | undefined;
     let usage: Record<string, number> = {};
@@ -157,7 +207,7 @@ async function main() {
       options: {
         cwd: agentDir,
         resume: sessionId,
-        settingSources: ['project', 'user'],
+        settingSources: minimalSettings ? [] : ['project', 'user'],
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         // Quick mode caps turns hard so an auto-routed voice answer

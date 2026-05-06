@@ -113,6 +113,7 @@ def load_env():
         logger.info("Loaded env from %s", env_path)
     else:
         logger.warning("No .env found at %s, relying on shell environment", env_path)
+    refresh_runtime_config_from_env()
 
 
 def check_required_keys(required: dict):
@@ -184,16 +185,128 @@ def _load_agent_roster():
 
 VALID_AGENTS = _load_agent_roster()
 
+
+def _load_agent_roster_entries() -> list[dict]:
+    """Return the dynamic roster entries in UI order."""
+    roster_path = Path("/tmp/warroom-agents.json")
+    try:
+        if roster_path.exists():
+            agents = json.loads(roster_path.read_text())
+            if isinstance(agents, list):
+                entries = []
+                for a in agents:
+                    if not isinstance(a, dict):
+                        continue
+                    aid = a.get("id")
+                    if isinstance(aid, str) and aid in VALID_AGENTS:
+                        entries.append({
+                            "id": aid,
+                            "name": a.get("name") if isinstance(a.get("name"), str) else aid.title(),
+                            "description": a.get("description") if isinstance(a.get("description"), str) else "",
+                        })
+                if entries:
+                    return entries
+    except Exception as exc:
+        logger.warning("Could not read agent roster entries: %s", exc)
+    return [
+        {"id": "main", "name": "Main", "description": "General ops and triage"},
+        {"id": "research", "name": "Research", "description": "Web research and analysis"},
+        {"id": "comms", "name": "Comms", "description": "Messaging and external communications"},
+        {"id": "content", "name": "Content", "description": "Writing and content production"},
+        {"id": "ops", "name": "Ops", "description": "Scheduling, systems, and automations"},
+    ]
+
+
+def _agent_label(agent_id: str) -> str:
+    for entry in _load_agent_roster_entries():
+        if entry["id"] == agent_id:
+            return entry.get("name") or agent_id.title()
+    return agent_id.title()
+
+
+def _voice_entry(agent_id: str) -> dict:
+    entry = AGENT_VOICES.get(agent_id)
+    if isinstance(entry, dict):
+        return entry
+    return {}
+
+
+def _voice_value(agent_id: str, field: str, default: str = "") -> str:
+    value = _voice_entry(agent_id).get(field)
+    if isinstance(value, str) and value:
+        return value
+    value = _voice_entry("main").get(field)
+    if isinstance(value, str) and value:
+        return value
+    return default
+
+
+def _team_participants(mode: str) -> list[str]:
+    """Return agents that should produce first-pass answers for team modes."""
+    ids = [entry["id"] for entry in _load_agent_roster_entries() if entry["id"] in VALID_AGENTS]
+    if mode == "broadcast":
+        return ids or ["main"]
+    specialists = [aid for aid in ids if aid != "main"]
+    return specialists or ids or ["main"]
+
 # Chat id used for agent-voice-bridge session persistence. The warroom is
 # a single shared meeting, not per-chat, so we use a fixed id unless the
 # environment provides an override (e.g. for running two warroom instances
 # side by side during testing).
 WARROOM_CHAT_ID = os.environ.get("WARROOM_CHAT_ID", "warroom")
 
-# Timeout for synchronous answer_as_agent invocations. Voice UX expects
-# answers back within a few seconds. 25s is the hard ceiling — past that
-# we fail the tool call and let Gemini recover conversationally.
-ANSWER_TIMEOUT_SEC = float(os.environ.get("WARROOM_ANSWER_TIMEOUT", "25"))
+# Timeout for synchronous answer_as_agent invocations. Claude SDK agents
+# usually return quickly, but Codex/Gemini CLI-backed agents can take longer
+# on first turn. Past this ceiling we fail the tool call and let Gemini
+# recover conversationally.
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.1fs", name, raw, default)
+        return default
+
+
+ANSWER_TIMEOUT_SEC = _env_float("WARROOM_ANSWER_TIMEOUT", 45.0)
+TEAM_AGENT_TIMEOUT_SEC = _env_float("WARROOM_TEAM_AGENT_TIMEOUT", ANSWER_TIMEOUT_SEC)
+TOOL_TIMEOUT_GRACE_SEC = _env_float("WARROOM_TOOL_TIMEOUT_GRACE", 10.0)
+TEAM_TOOL_TIMEOUT_SEC: float | None = None
+
+
+def refresh_runtime_config_from_env():
+    """Refresh runtime tunables after .env has been loaded."""
+    global ANSWER_TIMEOUT_SEC, TEAM_AGENT_TIMEOUT_SEC, TOOL_TIMEOUT_GRACE_SEC, TEAM_TOOL_TIMEOUT_SEC
+    ANSWER_TIMEOUT_SEC = _env_float("WARROOM_ANSWER_TIMEOUT", 45.0)
+    TEAM_AGENT_TIMEOUT_SEC = _env_float("WARROOM_TEAM_AGENT_TIMEOUT", ANSWER_TIMEOUT_SEC)
+    TOOL_TIMEOUT_GRACE_SEC = _env_float("WARROOM_TOOL_TIMEOUT_GRACE", 10.0)
+    raw_team_tool_timeout = os.environ.get("WARROOM_TEAM_TOOL_TIMEOUT")
+    TEAM_TOOL_TIMEOUT_SEC = None
+    if raw_team_tool_timeout is not None:
+        try:
+            TEAM_TOOL_TIMEOUT_SEC = float(raw_team_tool_timeout)
+        except ValueError:
+            logger.warning("Invalid WARROOM_TEAM_TOOL_TIMEOUT=%r; using computed timeout", raw_team_tool_timeout)
+
+ROUTER_MODES = {"auto", "router"}
+SINGLE_MODES = {"single"}
+TEAM_MODES = {"broadcast", "debate", "ensemble", "consensus"}
+
+
+def _answer_tool_timeout() -> float:
+    return ANSWER_TIMEOUT_SEC + TOOL_TIMEOUT_GRACE_SEC
+
+
+def _team_tool_timeout(mode: str) -> float:
+    if TEAM_TOOL_TIMEOUT_SEC is not None:
+        return TEAM_TOOL_TIMEOUT_SEC
+    participants = _team_participants(mode)
+    call_count = len(participants)
+    if mode in {"debate", "ensemble", "consensus"} and "main" in VALID_AGENTS and any(a != "main" for a in participants):
+        call_count += 1
+    return max(_answer_tool_timeout(), call_count * TEAM_AGENT_TIMEOUT_SEC + TOOL_TIMEOUT_GRACE_SEC)
 
 
 async def _run_subprocess(cmd: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
@@ -244,6 +357,175 @@ async def _run_subprocess(cmd: list[str], timeout: float = 20.0) -> tuple[int, s
                 pass
         return -1, "", "timeout"
     return proc.returncode or 0, stdout.decode(errors="replace").strip(), stderr.decode(errors="replace").strip()
+
+
+def _parse_voice_bridge_payload(out: str) -> dict:
+    """Parse the JSON payload printed by agent-voice-bridge.
+
+    The bridge itself writes one JSON object, but runtime adapters can log
+    progress to stdout before that final line. Read from the bottom so those
+    logs don't make the War Room treat a successful agent response as
+    "invalid bridge output".
+    """
+    for line in reversed((out or "").splitlines()):
+        text = line.strip()
+        if not text.startswith("{"):
+            continue
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise json.JSONDecodeError("no JSON object in voice bridge stdout", out or "", 0)
+
+
+async def _push_server_event(params, payload: dict, source: str = "warroom") -> None:
+    """Best-effort server-message event for the browser transcript/agent cards."""
+    from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    try:
+        await params.llm.push_frame(
+            RTVIServerMessageFrame(data=payload),
+            FrameDirection.DOWNSTREAM,
+        )
+    except Exception as exc:
+        logger.warning("%s: push %s frame failed: %s", source, payload.get("event"), exc)
+
+
+def _bridge_error_message(code: int, out: str, err: str) -> str:
+    bridge_error = ""
+    try:
+        payload = _parse_voice_bridge_payload(out) if out else {}
+        bridge_error = str(payload.get("error") or "")
+    except json.JSONDecodeError:
+        bridge_error = ""
+    err_short = (bridge_error or err or f"voice bridge exited {code}")[:300]
+    err_lower = (err_short + "\n" + (err or "")).lower()
+    if any(s in err_lower for s in ("oauth", "401", "unauthorized", "token", "credentials")):
+        return "auth failed (token expired?). Run `claude login` and restart the war room."
+    return err_short
+
+
+async def _call_voice_agent(
+    agent: str,
+    question: str,
+    *,
+    chat_id: str | None = None,
+    timeout: float | None = None,
+) -> dict:
+    """Invoke one configured agent through the Node voice bridge."""
+    if agent not in VALID_AGENTS:
+        return {"ok": False, "agent": agent, "error": f"invalid agent: {agent}"}
+    if not isinstance(question, str) or not question.strip():
+        return {"ok": False, "agent": agent, "error": "question is required"}
+    if not VOICE_BRIDGE.exists():
+        return {
+            "ok": False,
+            "agent": agent,
+            "error": "agent-voice-bridge not built; run `npm run build` from the project root",
+        }
+
+    cmd = [
+        NODE_BIN, str(VOICE_BRIDGE),
+        "--quick",
+        "--agent", agent,
+        "--chat-id", chat_id or WARROOM_CHAT_ID,
+        "--message", question,
+    ]
+    code, out, err = await _run_subprocess(cmd, timeout=timeout or ANSWER_TIMEOUT_SEC)
+    if code != 0:
+        err_short = _bridge_error_message(code, out, err)
+        logger.error("_call_voice_agent failed: agent=%s code=%d error=%s stderr=%s", agent, code, err_short, err[:200])
+        return {"ok": False, "agent": agent, "error": err_short}
+
+    try:
+        payload = _parse_voice_bridge_payload(out)
+    except json.JSONDecodeError:
+        logger.error("_call_voice_agent: invalid JSON from bridge: %r", out[:200])
+        return {"ok": False, "agent": agent, "error": "invalid bridge output"}
+
+    response_text = payload.get("response")
+    if payload.get("error") or not response_text:
+        return {"ok": False, "agent": agent, "error": payload.get("error") or "empty response"}
+    return {"ok": True, "agent": agent, "text": response_text, "usage": payload.get("usage")}
+
+
+def _build_team_agent_prompt(mode: str, agent: str, question: str, prior: list[dict]) -> str:
+    label = _agent_label(agent)
+    if mode == "broadcast":
+        return (
+            "[War Room broadcast mode]\n"
+            "Answer the user's prompt independently in 1-2 short sentences. "
+            "No preamble, no lists.\n\n"
+            f"User prompt: {question}"
+        )
+    if mode == "debate":
+        previous = "\n".join(
+            f"{_agent_label(r['agent'])}: {r.get('text')}"
+            for r in prior
+            if r.get("ok") and r.get("text")
+        )
+        return (
+            "[War Room debate mode]\n"
+            "Give a concise debate contribution in 1-2 short sentences. "
+            "If prior views are present, explicitly add a useful counterpoint, caveat, or agreement. "
+            "No preamble.\n\n"
+            f"User topic: {question}\n\n"
+            f"Prior views:\n{previous or '(none yet)'}\n\n"
+            f"Your turn as {label}:"
+        )
+    if mode == "ensemble":
+        return (
+            "[War Room ensemble mode]\n"
+            "Produce an independent candidate answer or approach in 1-2 short sentences. "
+            "Focus on your specialty. No preamble.\n\n"
+            f"User prompt: {question}"
+        )
+    if mode == "consensus":
+        return (
+            "[War Room consensus mode]\n"
+            "Give your independent view in 1-2 short sentences, with the key reason. "
+            "No preamble.\n\n"
+            f"User prompt: {question}"
+        )
+    return question
+
+
+def _build_team_judge_prompt(mode: str, question: str, responses: list[dict]) -> str:
+    joined = "\n".join(
+        f"- {_agent_label(r['agent'])}: {r.get('text') or r.get('error')}"
+        for r in responses
+    )
+    if mode == "debate":
+        task = "Synthesize the debate into a short conclusion and name the main disagreement if any."
+    elif mode == "ensemble":
+        task = "Select the strongest answer and combine useful parts into a concise final response."
+    else:
+        task = "Synthesize a concise consensus, naming any unresolved split if there is one."
+    return (
+        f"[War Room {mode} judge]\n"
+        f"{task} Answer in 2-3 short sentences. No preamble.\n\n"
+        f"User prompt: {question}\n\n"
+        f"Agent responses:\n{joined}"
+    )
+
+
+def _format_team_response(mode: str, responses: list[dict]) -> str:
+    label = {
+        "broadcast": "Broadcast",
+        "debate": "Debate",
+        "ensemble": "Ensemble",
+        "consensus": "Consensus",
+    }.get(mode, mode.title())
+    lines = [f"{label}:"]
+    for r in responses:
+        name = _agent_label(r["agent"])
+        text = r.get("text") if r.get("ok") else f"[failed: {r.get('error', 'unknown error')}]"
+        role = "Judge" if r.get("role") == "judge" else name
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines)
 
 
 async def delegate_to_agent_handler(params):
@@ -357,14 +639,14 @@ async def answer_as_agent_handler(params):
     converts our frame into a wire-format "server-message" that the
     Pipecat JS client delivers to onServerMessage.
 
-    CRITICAL: like delegate_to_agent, we pass run_llm=False on the result
-    so Pipecat does NOT trigger a follow-up Gemini inference. Without this,
-    Gemini speaks the delegation acknowledgment twice.
+    Unlike delegate_to_agent, success MUST allow a follow-up Gemini inference:
+    the agent text is returned as a tool result and Gemini Live then reads the
+    text field aloud. Error paths stay silent because the browser receives a
+    visible agent_error event.
     """
     from pipecat.frames.frames import FunctionCallResultProperties
     silent = FunctionCallResultProperties(run_llm=False)
-    from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
-    from pipecat.processors.frame_processor import FrameDirection
+    speak = FunctionCallResultProperties(run_llm=True)
 
     args = params.arguments or {}
     agent = args.get("agent")
@@ -377,88 +659,26 @@ async def answer_as_agent_handler(params):
         }, properties=silent)
         return
 
-    if not VOICE_BRIDGE.exists():
-        await params.result_callback({
-            "ok": False,
-            "error": "agent-voice-bridge not built; run `npm run build` from the project root",
-        }, properties=silent)
-        return
-
-    # Helper: push a server-message envelope to the browser. RTVI observer
-    # wraps it for the Pipecat JS client's onServerMessage callback.
-    # Best-effort — if the pipeline is mid-teardown the push can fail; the
-    # failure is non-fatal because the user-visible state is recoverable on
-    # the next interaction.
-    async def _push_event(payload: dict) -> None:
-        try:
-            await params.llm.push_frame(
-                RTVIServerMessageFrame(data=payload),
-                FrameDirection.DOWNSTREAM,
-            )
-        except Exception as exc:
-            logger.warning("answer_as_agent: push %s frame failed: %s", payload.get("event"), exc)
-
     # Fire the hand-up signal to the browser BEFORE the expensive
     # subprocess call. The RTVIObserver in the pipeline picks this up
     # and wraps it into an RTVI "server-message" envelope that the JS
     # client surfaces via onServerMessage. This is how the user sees
     # "research has their hand up" a beat before hearing the answer.
-    await _push_event({"event": "agent_selected", "agent": agent})
+    await _push_server_event(params, {"event": "agent_selected", "agent": agent}, source="answer_as_agent")
 
     logger.info("answer_as_agent: agent=%s question=%r", agent, question[:80])
 
-    cmd = [
-        NODE_BIN, str(VOICE_BRIDGE),
-        "--quick",
-        "--agent", agent,
-        "--chat-id", WARROOM_CHAT_ID,
-        "--message", question,
-    ]
-    code, out, err = await _run_subprocess(cmd, timeout=ANSWER_TIMEOUT_SEC)
-
-    if code != 0:
-        logger.error("answer_as_agent failed: code=%d stderr=%s", code, err[:200])
+    result = await _call_voice_agent(agent, question, chat_id=WARROOM_CHAT_ID, timeout=ANSWER_TIMEOUT_SEC)
+    if not result.get("ok"):
         # Tell the browser to drop the hand-up animation immediately and
         # surface a visible error so the user knows the agent did NOT
         # answer rather than silently waiting for nothing. This covers both
         # the 25s timeout path (silent stuck hand-up was the main UX bug)
         # and OAuth-token-expired / bridge-failed paths (Gemini would have
         # mumbled a vague recovery line; now the user sees a real banner).
-        await _push_event({"event": "hand_down", "agent": agent})
-        err_short = (err[:200] if err else "voice bridge failed")
-        # Heuristic: if stderr contains hints of OAuth/auth failure, surface
-        # an actionable message. Otherwise pass the raw stderr snippet.
-        err_lower = (err or "").lower()
-        if any(s in err_lower for s in ("oauth", "401", "unauthorized", "token", "credentials")):
-            err_short = "auth failed (token expired?). Run `claude login` and restart the war room."
-        await _push_event({"event": "agent_error", "agent": agent, "error": err_short})
-        await params.result_callback({
-            "ok": False,
-            "agent": agent,
-            "error": err_short,
-        }, properties=silent)
-        return
-
-    # The voice bridge prints a single JSON line to stdout:
-    #   {"response": "...", "usage": {...}, "error": null}
-    try:
-        payload = json.loads(out)
-    except json.JSONDecodeError:
-        logger.error("answer_as_agent: invalid JSON from bridge: %r", out[:200])
-        await _push_event({"event": "hand_down", "agent": agent})
-        await _push_event({"event": "agent_error", "agent": agent, "error": "invalid bridge output"})
-        await params.result_callback({
-            "ok": False,
-            "agent": agent,
-            "error": "invalid bridge output",
-        }, properties=silent)
-        return
-
-    response_text = payload.get("response")
-    if payload.get("error") or not response_text:
-        err_msg = payload.get("error") or "empty response"
-        await _push_event({"event": "hand_down", "agent": agent})
-        await _push_event({"event": "agent_error", "agent": agent, "error": err_msg[:200]})
+        err_msg = str(result.get("error") or "voice bridge failed")
+        await _push_server_event(params, {"event": "hand_down", "agent": agent}, source="answer_as_agent")
+        await _push_server_event(params, {"event": "agent_error", "agent": agent, "error": err_msg[:200]}, source="answer_as_agent")
         await params.result_callback({
             "ok": False,
             "agent": agent,
@@ -469,13 +689,104 @@ async def answer_as_agent_handler(params):
     # Success: drop the hand-up animation now that the agent has actually
     # answered. The browser's 6s auto-clear is a fallback; this fires the
     # instant the spoken response arrives, which feels natural.
-    await _push_event({"event": "hand_down", "agent": agent})
+    await _push_server_event(params, {"event": "hand_down", "agent": agent}, source="answer_as_agent")
 
     await params.result_callback({
         "ok": True,
         "agent": agent,
-        "text": response_text,
-    }, properties=silent)
+        "text": result.get("text"),
+    }, properties=speak)
+
+
+async def answer_team_handler(params, active_mode: str):
+    """Tool: run a whole-team voice turn using mesh-like modes."""
+    from pipecat.frames.frames import FunctionCallResultProperties
+    silent = FunctionCallResultProperties(run_llm=False)
+    speak = FunctionCallResultProperties(run_llm=True)
+
+    args = params.arguments or {}
+    question = args.get("question")
+    if active_mode not in TEAM_MODES:
+        await params.result_callback({"ok": False, "error": f"invalid team mode: {active_mode}"}, properties=silent)
+        return
+    if not isinstance(question, str) or not question.strip():
+        await params.result_callback({"ok": False, "error": "question is required"}, properties=silent)
+        return
+
+    participants = _team_participants(active_mode)
+    logger.info("answer_team: mode=%s participants=%s question=%r", active_mode, participants, question[:80])
+
+    responses: list[dict] = []
+    chat_id = f"{WARROOM_CHAT_ID}:{active_mode}"
+
+    # Phase 1 — parallelize where it's semantically valid.
+    #
+    # broadcast/ensemble/consensus: each agent answers independently of the
+    # others, so we fan out and asyncio.gather the calls. Wall-clock then
+    # collapses from sum(per_agent) to max(per_agent) — for our 3-agent
+    # roster (~13s + ~14s + ~18s), that's ~45s sequential vs ~18s parallel.
+    #
+    # debate: each contribution explicitly references prior speakers, so
+    # the prompt for agent N depends on responses[0..N-1]. Stays sequential.
+    #
+    # Per-agent errors (timeout, exit code) DON'T abort the whole turn —
+    # we collect a result dict for every participant so the user gets
+    # whatever responded, plus explicit "agent_error" events for the rest.
+
+    async def _run_one(agent: str, prior: list[dict]) -> dict:
+        prompt = _build_team_agent_prompt(active_mode, agent, question, prior)
+        await _push_server_event(params, {"event": "agent_selected", "agent": agent}, source="answer_team")
+        try:
+            result = await _call_voice_agent(agent, prompt, chat_id=chat_id, timeout=TEAM_AGENT_TIMEOUT_SEC)
+        except Exception as exc:
+            logger.exception("answer_team: agent=%s raised", agent)
+            result = {"ok": False, "agent": agent, "error": f"unexpected: {exc}"[:200]}
+        await _push_server_event(params, {"event": "hand_down", "agent": agent}, source="answer_team")
+        if not result.get("ok"):
+            await _push_server_event(
+                params,
+                {"event": "agent_error", "agent": agent, "error": str(result.get("error") or "failed")[:200]},
+                source="answer_team",
+            )
+        return result
+
+    PARALLEL_MODES = {"broadcast", "ensemble", "consensus"}
+    if active_mode in PARALLEL_MODES:
+        # No shared prior — every agent gets the same `prior=[]` so the
+        # prompt builder produces the same baseline for everyone. Order
+        # of `responses` follows `participants` (zip with raw_results).
+        raw_results = await asyncio.gather(
+            *[_run_one(agent, []) for agent in participants],
+            return_exceptions=False,  # _run_one already wraps exceptions in result dicts
+        )
+        responses.extend(raw_results)
+    else:
+        # debate (or any future sequential mode): each agent sees prior
+        # contributions so the call_count×timeout fan-out is intentional.
+        for agent in participants:
+            responses.append(await _run_one(agent, responses))
+
+    if active_mode in {"debate", "ensemble", "consensus"} and "main" in VALID_AGENTS and any(r["agent"] != "main" for r in responses):
+        judge_prompt = _build_team_judge_prompt(active_mode, question, responses)
+        await _push_server_event(params, {"event": "agent_selected", "agent": "main"}, source="answer_team")
+        judge = await _call_voice_agent("main", judge_prompt, chat_id=chat_id, timeout=TEAM_AGENT_TIMEOUT_SEC)
+        await _push_server_event(params, {"event": "hand_down", "agent": "main"}, source="answer_team")
+        if not judge.get("ok"):
+            await _push_server_event(
+                params,
+                {"event": "agent_error", "agent": "main", "error": str(judge.get("error") or "failed")[:200]},
+                source="answer_team",
+            )
+        judge["role"] = "judge"
+        responses.append(judge)
+
+    text = _format_team_response(active_mode, responses)
+    await params.result_callback({
+        "ok": any(r.get("ok") for r in responses),
+        "mode": active_mode,
+        "text": text,
+        "responses": responses,
+    }, properties=speak)
 
 
 # ─── Mode 1: Gemini Live (speech-to-speech + tools) ────────────────────────
@@ -485,8 +796,17 @@ PIN_PATH = Path("/tmp/warroom-pin.json")
 LANGUAGE_PATH = Path("/tmp/warroom-language.json")
 PROVIDER_PATH = Path("/tmp/warroom-provider.json")
 
-VALID_MODES = {"direct", "auto"}
-VALID_PROVIDERS = {"gemini-live", "gemini-live-25", "xai", "groq", "cartesia"}
+VALID_MODES = {"direct", "auto", "router", "single", "broadcast", "debate", "ensemble", "consensus"}
+VALID_PROVIDERS = {
+    "gemini-live",
+    "gemini-live-25",
+    "xai",
+    "groq",
+    "cartesia",
+    "elevenlabs",
+    "voxtral",
+    "mixed",
+}
 
 
 def read_provider_pin() -> str | None:
@@ -495,8 +815,12 @@ def read_provider_pin() -> str | None:
     Values:
       - "gemini-live"     Gemini 3.1 Flash Live (current default, audio E2E)
       - "gemini-live-25"  Gemini 2.5 native-audio (lower latency, mature)
+      - "xai"             xAI Grok realtime Voice Agent
       - "groq"            Groq Whisper STT + Claude bridge + Groq PlayAI TTS
       - "cartesia"        Deepgram STT + Claude bridge + Cartesia TTS (legacy)
+      - "elevenlabs"      Groq Whisper STT + Claude bridge + ElevenLabs TTS
+      - "voxtral"         Voxtral STT/TTS + Claude bridge
+      - "mixed"           Groq Whisper STT + Claude bridge + per-agent TTS
 
     Falls back to WARROOM_MODE env when None.
     """
@@ -582,10 +906,10 @@ async def run_live_mode():
     active_agent, active_mode = read_pin_state()
     logger.info("Active agent=%s mode=%s", active_agent, active_mode)
 
-    # In auto mode, voice comes from main (Gemini is the front desk,
-    # agents answer through it verbatim so they all sound the same
-    # until v2 session pooling lands).
-    voice_agent = "main" if active_mode == "auto" else active_agent
+    # Router/team modes use main as the Gemini front desk. Direct and single
+    # modes use the pinned/default agent voice so per-agent voice edits take
+    # effect when the user intentionally talks to one agent.
+    voice_agent = "main" if active_mode in ROUTER_MODES | TEAM_MODES else active_agent
     active_entry = AGENT_VOICES.get(voice_agent) or AGENT_VOICES.get("main", {})
     configured_voice = active_entry.get("gemini_voice") or "Charon"
     voice = os.environ.get("WARROOM_LIVE_VOICE", configured_voice)
@@ -645,19 +969,21 @@ async def run_live_mode():
         required=[],
     )
 
-    # answer_as_agent is only registered in auto mode. In direct mode,
+    # answer_as_agent is registered in router and single modes. In direct mode,
     # Gemini should not be routing calls away from the pinned agent —
     # the pinned agent IS the one answering, via its own persona.
     standard_tools = [delegate_schema, get_time_schema, list_agents_schema]
-    if active_mode == "auto":
+    if active_mode in ROUTER_MODES | SINGLE_MODES:
         answer_schema = FunctionSchema(
             name="answer_as_agent",
             description=(
-                "Route the user's question to the best-fit specialist and return their "
-                "answer verbatim. Use this for EVERY substantive question in auto mode. "
-                "Pick the agent whose role matches the question. Speak a one-word "
-                "acknowledgment BEFORE calling this tool, then when it returns, read "
-                "the 'text' field verbatim with no commentary."
+                "Invoke exactly one specialist agent through the real agent runtime and return "
+                "their answer verbatim. In router mode, pick the best-fit agent unless the "
+                "user names one. In single mode, use the named agent if present, otherwise "
+                "use the pinned/default agent from the system instruction. If the user names "
+                "an agent at the start, use that agent even for greetings or small talk. Speak "
+                "a one-word acknowledgment BEFORE calling this tool, then when it returns, "
+                "read the 'text' field verbatim with no commentary."
             ),
             properties={
                 "agent": {
@@ -673,6 +999,24 @@ async def run_live_mode():
             required=["agent", "question"],
         )
         standard_tools.append(answer_schema)
+    if active_mode in TEAM_MODES:
+        team_schema = FunctionSchema(
+            name="answer_team",
+            description=(
+                f"Run the current War Room team mode ({active_mode}) through the real agent runtimes. "
+                "Use this for EVERY substantive user turn in broadcast, debate, ensemble, or consensus "
+                "mode. Return the combined team response verbatim. Do not answer the substantive "
+                "question yourself."
+            ),
+            properties={
+                "question": {
+                    "type": "string",
+                    "description": "The user's full prompt or topic for the team.",
+                },
+            },
+            required=["question"],
+        )
+        standard_tools.append(team_schema)
 
     tools = ToolsSchema(standard_tools=standard_tools)
 
@@ -691,10 +1035,12 @@ async def run_live_mode():
     )
     if model:
         live_kwargs["model"] = model
-    # Always pass voice_id so the configured agent voice takes effect,
-    # even for main (Charon). Pipecat only warns about deprecation, not
-    # actively breaks.
+
+    # Pipecat 0.0.108 still accepts the old voice_id argument, but the
+    # canonical API is Settings(voice=...). Set both so current installs and
+    # newer Pipecat versions pick up the dashboard voice consistently.
     live_kwargs["voice_id"] = voice
+    settings_kwargs = {"voice": voice}
 
     # Pin Gemini Live's input speech recognition to the same language we
     # ask it to respond in. system_instruction only controls OUTPUT;
@@ -711,12 +1057,14 @@ async def run_live_mode():
     #     (legacy auto-detect behavior — drifts).
     if resolved_language and resolved_language != "auto":
         try:
-            live_kwargs["settings"] = GeminiLiveLLMService.Settings(language=resolved_language)
+            settings_kwargs["language"] = resolved_language
             logger.info("Gemini Live STT language pinned to %s", resolved_language)
         except Exception as exc:
             logger.warning("Could not set Gemini Live STT language to %s: %s", resolved_language, exc)
     elif resolved_language == "auto":
         logger.info("Gemini Live in multilingual auto mode (output mirrors user's language)")
+    live_kwargs["settings"] = GeminiLiveLLMService.Settings(**settings_kwargs)
+    logger.info("Gemini Live voice=%s voice_agent=%s mode=%s", voice, voice_agent, active_mode)
 
     llm = GeminiLiveLLMService(**live_kwargs)
 
@@ -726,8 +1074,21 @@ async def run_live_mode():
     llm.register_function("delegate_to_agent", delegate_to_agent_handler)
     llm.register_function("get_time", get_time_handler)
     llm.register_function("list_agents", list_agents_handler)
-    if active_mode == "auto":
-        llm.register_function("answer_as_agent", answer_as_agent_handler)
+    if active_mode in ROUTER_MODES | SINGLE_MODES:
+        llm.register_function(
+            "answer_as_agent",
+            answer_as_agent_handler,
+            timeout_secs=_answer_tool_timeout(),
+        )
+    if active_mode in TEAM_MODES:
+        async def _active_answer_team_handler(params):
+            await answer_team_handler(params, active_mode)
+
+        llm.register_function(
+            "answer_team",
+            _active_answer_team_handler,
+            timeout_secs=_team_tool_timeout(active_mode),
+        )
 
     # Context aggregator pair. This is the piece that was missing before —
     # it routes user speech / Gemini responses into the LLMContext and
@@ -860,6 +1221,7 @@ async def run_xai_mode():
     """
     from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
     from pipecat.services.xai.realtime import events as xai_events
+    from personas import get_persona
 
     check_required_keys({
         "XAI_API_KEY": "xAI Grok (Voice Agent realtime)",
@@ -979,8 +1341,8 @@ async def run_elevenlabs_mode():
     step stays on Claude (with full skills/MCPs) via the same bridge as Groq
     mode — only the TTS service differs.
 
-    Voice picks the env-configured ELEVENLABS_VOICE_ID (per-agent voices.json
-    overrides via voices_id field once we plumb it; currently global).
+    Voice picks per-agent voices.json `elevenlabs_voice_id`, falling back to
+    ELEVENLABS_VOICE_ID. The bridge can switch voices per routed response.
     """
     from pipecat.services.groq.stt import GroqSTTService
     from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
@@ -990,24 +1352,31 @@ async def run_elevenlabs_mode():
     check_required_keys({
         "GROQ_API_KEY": "Whisper STT (ElevenLabs has no STT of its own)",
         "ELEVENLABS_API_KEY": "ElevenLabs TTS",
-        "ELEVENLABS_VOICE_ID": "ElevenLabs voice (e.g. Sarah=EXAVITQu4vr4xnSDxMaL)",
     })
 
     port = int(os.environ.get("WARROOM_PORT", "7860"))
     transport = make_transport(port)
 
+    active_agent, _active_mode = read_pin_state()
     stt = GroqSTTService(api_key=os.environ["GROQ_API_KEY"])
-    voice_id = os.environ["ELEVENLABS_VOICE_ID"]
+    voice_id = _voice_value(active_agent, "elevenlabs_voice_id", os.environ.get("ELEVENLABS_VOICE_ID", ""))
+    if not voice_id:
+        raise RuntimeError(
+            "ElevenLabs voice not configured. Set ELEVENLABS_VOICE_ID or per-agent "
+            "voices.json field `elevenlabs_voice_id`."
+        )
     tts = ElevenLabsTTSService(
         api_key=os.environ["ELEVENLABS_API_KEY"],
-        voice_id=voice_id,
-        # Multilingual v2 handles PT-BR + EN code-switch reliably; eleven_turbo_v2_5
-        # is faster but EN-only by default. Override with WARROOM_ELEVENLABS_MODEL.
-        model=os.environ.get("WARROOM_ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+        settings=ElevenLabsTTSService.Settings(
+            voice=voice_id,
+            # Multilingual v2 handles PT-BR + EN code-switch reliably; eleven_turbo_v2_5
+            # is faster but EN-only by default. Override with WARROOM_ELEVENLABS_MODEL.
+            model=os.environ.get("WARROOM_ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+        ),
     )
 
     router = AgentRouter()
-    bridge = ClaudeAgentBridge()
+    bridge = ClaudeAgentBridge(voice_field="elevenlabs_voice_id", default_voice=voice_id)
 
     pipeline = Pipeline([
         transport.input(),
@@ -1078,7 +1447,11 @@ async def run_voxtral_mode():
     transport = make_transport(port)
 
     router = AgentRouter()
-    bridge = ClaudeAgentBridge()
+    bridge = ClaudeAgentBridge(
+        voice_field="voxtral_voice_id",
+        default_voice=os.environ.get("WARROOM_VOXTRAL_VOICE_ID", ""),
+        ref_audio_field="voxtral_ref_audio_path",
+    )
 
     pipeline = Pipeline([
         transport.input(),
@@ -1133,6 +1506,7 @@ async def _build_voxtral_services():
         TTSAudioRawFrame,
         TTSStartedFrame,
         TTSStoppedFrame,
+        TTSUpdateSettingsFrame,
         TextFrame,
     )
     from pipecat.services.ai_service import AIService
@@ -1142,20 +1516,19 @@ async def _build_voxtral_services():
         "WARROOM_VOXTRAL_STT_MODEL", "voxtral-mini-transcribe-realtime-2602"
     )
     tts_model = os.environ.get("WARROOM_VOXTRAL_TTS_MODEL", "voxtral-mini-tts-2603")
-    voice_id = os.environ.get("WARROOM_VOXTRAL_VOICE_ID", "")
-    ref_audio_path = os.environ.get("WARROOM_VOXTRAL_REF_AUDIO_PATH", "")
+    default_voice_id = os.environ.get("WARROOM_VOXTRAL_VOICE_ID", "")
+    default_ref_audio_path = os.environ.get("WARROOM_VOXTRAL_REF_AUDIO_PATH", "")
 
-    # Pre-load ref_audio once so cloning doesn't reread the file on every
-    # synthesize call. Empty string when neither voice_id nor ref_audio set
-    # → Mistral falls back to its built-in preset voice.
-    ref_audio_b64 = ""
-    if ref_audio_path and not voice_id:
+    def _read_ref_audio(path: str) -> str:
+        if not path:
+            return ""
         try:
             import base64
-            with open(ref_audio_path, "rb") as f:
-                ref_audio_b64 = base64.b64encode(f.read()).decode()
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
         except OSError as exc:
-            logger.warning("Could not read voxtral ref_audio %s: %s", ref_audio_path, exc)
+            logger.warning("Could not read voxtral ref_audio %s: %s", path, exc)
+            return ""
 
     class VoxtralRealtimeSTT(AIService):
         """Streams PcmS16le 16kHz audio frames to Voxtral realtime WebSocket
@@ -1234,6 +1607,9 @@ async def _build_voxtral_services():
         def __init__(self):
             super().__init__()
             self._client = Mistral(api_key=api_key)
+            self._voice_id = default_voice_id
+            self._ref_audio_path = default_ref_audio_path
+            self._ref_audio_b64 = _read_ref_audio(default_ref_audio_path) if not default_voice_id else ""
 
         async def _synthesize(self, text: str):
             kwargs = {
@@ -1242,10 +1618,10 @@ async def _build_voxtral_services():
                 "response_format": "pcm",  # match transport output sample format
                 "stream": True,
             }
-            if voice_id:
-                kwargs["voice_id"] = voice_id
-            elif ref_audio_b64:
-                kwargs["ref_audio"] = ref_audio_b64
+            if self._voice_id:
+                kwargs["voice_id"] = self._voice_id
+            elif self._ref_audio_b64:
+                kwargs["ref_audio"] = self._ref_audio_b64
             # Else: Mistral uses its preset default voice.
 
             await self.push_frame(TTSStartedFrame())
@@ -1261,12 +1637,388 @@ async def _build_voxtral_services():
 
         async def process_frame(self, frame: Frame, direction):
             await super().process_frame(frame, direction)
+            if isinstance(frame, TTSUpdateSettingsFrame):
+                voice = frame.settings.get("voice") if isinstance(frame.settings, dict) else None
+                ref_audio_path = frame.settings.get("ref_audio_path") if isinstance(frame.settings, dict) else None
+                if isinstance(voice, str):
+                    self._voice_id = voice
+                    if voice:
+                        self._ref_audio_b64 = ""
+                if isinstance(ref_audio_path, str) and ref_audio_path != self._ref_audio_path:
+                    self._ref_audio_path = ref_audio_path
+                    if not self._voice_id:
+                        self._ref_audio_b64 = _read_ref_audio(ref_audio_path)
+                return
             if isinstance(frame, TextFrame) and frame.text:
                 await self._synthesize(frame.text)
             else:
                 await self.push_frame(frame, direction)
 
     return VoxtralRealtimeSTT(), VoxtralStreamingTTS()
+
+
+def _build_mixed_tts_service():
+    """Construct a TTS service that switches providers per agent response.
+
+    The Claude bridge emits TTSUpdateSettingsFrame(settings={provider, voice,
+    ref_audio_path}) before each TextFrame. This service consumes that metadata
+    and synthesizes the next response with xAI, ElevenLabs, Voxtral, or Groq.
+    """
+    from pipecat.frames.frames import (
+        ErrorFrame,
+        Frame,
+        TTSAudioRawFrame,
+        TTSUpdateSettingsFrame,
+    )
+    from pipecat.processors.frame_processor import FrameDirection
+    from pipecat.services.tts_service import TTSService
+
+    def _normalize_provider(provider: str | None) -> str:
+        value = (provider or "").strip().lower()
+        if value == "grok":
+            return "xai"
+        return value
+
+    def _read_ref_audio(path: str) -> str:
+        if not path:
+            return ""
+        try:
+            import base64
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+        except OSError as exc:
+            logger.warning("Could not read voxtral ref_audio %s: %s", path, exc)
+            return ""
+
+    class MixedProviderTTSService(TTSService):
+        """HTTP/SDK-backed TTS router for War Room mixed provider mode."""
+
+        def __init__(self):
+            super().__init__(
+                push_start_frame=True,
+                push_stop_frames=True,
+                pause_frame_processing=True,
+            )
+            self._provider = _normalize_provider(os.environ.get("WARROOM_MIXED_DEFAULT_PROVIDER", ""))
+            self._voice = ""
+            self._ref_audio_path = ""
+            self._http_session = None
+            self._groq_client = None
+            self._mistral_client = None
+
+        async def _session(self):
+            if self._http_session is None or self._http_session.closed:
+                import aiohttp
+                self._http_session = aiohttp.ClientSession()
+            return self._http_session
+
+        async def stop(self, frame):
+            await super().stop(frame)
+            await self._close()
+
+        async def cancel(self, frame):
+            await super().cancel(frame)
+            await self._close()
+
+        async def _close(self):
+            if self._http_session and not self._http_session.closed:
+                await self._http_session.close()
+            self._http_session = None
+
+        async def process_frame(self, frame: Frame, direction: FrameDirection):
+            if isinstance(frame, TTSUpdateSettingsFrame) and frame.service in (None, self):
+                settings = frame.settings if isinstance(frame.settings, dict) else {}
+                if any(key in settings for key in ("provider", "voice", "ref_audio_path")):
+                    if "provider" in settings:
+                        self._provider = _normalize_provider(str(settings.get("provider") or ""))
+                    if "voice" in settings:
+                        self._voice = str(settings.get("voice") or "").strip()
+                    if "ref_audio_path" in settings:
+                        self._ref_audio_path = str(settings.get("ref_audio_path") or "").strip()
+                    logger.info(
+                        "mixed TTS route provider=%s voice=%s ref_audio=%s",
+                        self._provider or "auto",
+                        self._voice or "default",
+                        bool(self._ref_audio_path),
+                    )
+                    return
+            await super().process_frame(frame, direction)
+
+        def _provider_ready(self, provider: str) -> bool:
+            if provider == "xai":
+                return bool(os.environ.get("XAI_API_KEY"))
+            if provider == "elevenlabs":
+                return bool(os.environ.get("ELEVENLABS_API_KEY")) and bool(
+                    self._voice or os.environ.get("ELEVENLABS_VOICE_ID")
+                )
+            if provider == "voxtral":
+                return bool(os.environ.get("MISTRAL_API_KEY"))
+            if provider == "groq":
+                return bool(os.environ.get("GROQ_API_KEY"))
+            return False
+
+        def _select_provider(self) -> str:
+            candidates = [
+                self._provider,
+                _normalize_provider(os.environ.get("WARROOM_MIXED_DEFAULT_PROVIDER", "")),
+                "xai",
+                "elevenlabs",
+                "voxtral",
+                "groq",
+            ]
+            seen: set[str] = set()
+            for provider in candidates:
+                provider = _normalize_provider(provider)
+                if not provider or provider in seen:
+                    continue
+                seen.add(provider)
+                if self._provider_ready(provider):
+                    return provider
+            return ""
+
+        async def run_tts(self, text: str, context_id: str):
+            provider = self._select_provider()
+            if not provider:
+                yield ErrorFrame(
+                    error=(
+                        "Mixed War Room TTS has no available provider. Configure XAI_API_KEY, "
+                        "or ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID, or MISTRAL_API_KEY, "
+                        "or GROQ_API_KEY."
+                    )
+                )
+                return
+
+            preferred = self._provider or "auto"
+            if self._provider and provider != self._provider:
+                logger.warning("mixed TTS provider %s unavailable, falling back to %s", preferred, provider)
+
+            if provider == "xai":
+                async for frame in self._run_xai_tts(text, context_id):
+                    yield frame
+            elif provider == "elevenlabs":
+                async for frame in self._run_elevenlabs_tts(text, context_id):
+                    yield frame
+            elif provider == "voxtral":
+                async for frame in self._run_voxtral_tts(text, context_id):
+                    yield frame
+            elif provider == "groq":
+                async for frame in self._run_groq_tts(text, context_id):
+                    yield frame
+            else:
+                yield ErrorFrame(error=f"Unsupported mixed TTS provider: {provider}")
+
+        async def _run_xai_tts(self, text: str, context_id: str):
+            voice = self._voice or os.environ.get("WARROOM_XAI_VOICE", "Ara")
+            sample_rate = self.sample_rate or 24000
+            session = await self._session()
+            payload = {
+                "text": text,
+                "voice_id": voice,
+                "output_format": {"codec": "pcm", "sample_rate": sample_rate},
+            }
+            language = read_language_pin() or os.environ.get("WARROOM_LANGUAGE", "")
+            if language and language != "auto":
+                payload["language"] = {
+                    "pt-BR": "pt",
+                    "pt-PT": "pt",
+                    "en-US": "en",
+                    "en-GB": "en",
+                    "es-ES": "es",
+                    "fr-FR": "fr",
+                    "de-DE": "de",
+                }.get(language, language)
+            headers = {
+                "Authorization": f"Bearer {os.environ['XAI_API_KEY']}",
+                "Content-Type": "application/json",
+            }
+            measuring_ttfb = True
+            try:
+                async with session.post("https://api.x.ai/v1/tts", json=payload, headers=headers) as response:
+                    if response.status != 200:
+                        error = await response.text(errors="ignore")
+                        yield ErrorFrame(error=f"xAI TTS failed ({response.status}): {error[:300]}")
+                        return
+                    await self.start_tts_usage_metrics(text)
+                    async for chunk in response.content.iter_chunked(self.chunk_size):
+                        if not chunk:
+                            continue
+                        if measuring_ttfb:
+                            await self.stop_ttfb_metrics()
+                            measuring_ttfb = False
+                        yield TTSAudioRawFrame(chunk, sample_rate, 1, context_id=context_id)
+            except Exception as exc:
+                yield ErrorFrame(error=f"xAI TTS failed: {exc}")
+
+        async def _run_elevenlabs_tts(self, text: str, context_id: str):
+            from pipecat.services.elevenlabs.tts import output_format_from_sample_rate
+
+            voice = self._voice or os.environ.get("ELEVENLABS_VOICE_ID", "")
+            if not voice:
+                yield ErrorFrame(error="ElevenLabs voice not configured for mixed TTS")
+                return
+            sample_rate = self.sample_rate or 24000
+            model = os.environ.get("WARROOM_ELEVENLABS_MODEL", "eleven_multilingual_v2")
+            session = await self._session()
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}/stream"
+            params = {"output_format": output_format_from_sample_rate(sample_rate)}
+            payload = {"text": text, "model_id": model}
+            headers = {
+                "xi-api-key": os.environ["ELEVENLABS_API_KEY"],
+                "Content-Type": "application/json",
+            }
+            measuring_ttfb = True
+            try:
+                async with session.post(url, params=params, json=payload, headers=headers) as response:
+                    if response.status != 200:
+                        error = await response.text(errors="ignore")
+                        yield ErrorFrame(error=f"ElevenLabs TTS failed ({response.status}): {error[:300]}")
+                        return
+                    await self.start_tts_usage_metrics(text)
+                    async for chunk in response.content.iter_chunked(self.chunk_size):
+                        if not chunk:
+                            continue
+                        if measuring_ttfb:
+                            await self.stop_ttfb_metrics()
+                            measuring_ttfb = False
+                        yield TTSAudioRawFrame(chunk, sample_rate, 1, context_id=context_id)
+            except Exception as exc:
+                yield ErrorFrame(error=f"ElevenLabs TTS failed: {exc}")
+
+        async def _run_voxtral_tts(self, text: str, context_id: str):
+            if self._mistral_client is None:
+                try:
+                    from mistralai.client import Mistral
+                except ImportError as exc:
+                    yield ErrorFrame(error="mistralai SDK not installed for Voxtral mixed TTS")
+                    return
+                self._mistral_client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+
+            voice = self._voice or os.environ.get("WARROOM_VOXTRAL_VOICE_ID", "")
+            ref_audio_path = self._ref_audio_path or os.environ.get("WARROOM_VOXTRAL_REF_AUDIO_PATH", "")
+            kwargs = {
+                "model": os.environ.get("WARROOM_VOXTRAL_TTS_MODEL", "voxtral-mini-tts-2603"),
+                "input": text,
+                "response_format": "pcm",
+                "stream": True,
+            }
+            if voice:
+                kwargs["voice_id"] = voice
+            else:
+                ref_audio = _read_ref_audio(ref_audio_path)
+                if ref_audio:
+                    kwargs["ref_audio"] = ref_audio
+
+            measuring_ttfb = True
+            try:
+                stream = await self._mistral_client.audio.speech.complete_async(**kwargs)
+                await self.start_tts_usage_metrics(text)
+                async for event in stream:
+                    audio_data = None
+                    if getattr(event, "event", None) == "speech.audio.delta":
+                        audio_data = getattr(getattr(event, "data", None), "audio_data", None)
+                    elif isinstance(event, (bytes, bytearray)):
+                        if measuring_ttfb:
+                            await self.stop_ttfb_metrics()
+                            measuring_ttfb = False
+                        yield TTSAudioRawFrame(bytes(event), 24000, 1, context_id=context_id)
+                        continue
+                    if not audio_data:
+                        continue
+                    import base64
+                    if measuring_ttfb:
+                        await self.stop_ttfb_metrics()
+                        measuring_ttfb = False
+                    yield TTSAudioRawFrame(base64.b64decode(audio_data), 24000, 1, context_id=context_id)
+            except Exception as exc:
+                yield ErrorFrame(error=f"Voxtral TTS failed: {exc}")
+
+        async def _run_groq_tts(self, text: str, context_id: str):
+            if self._groq_client is None:
+                from groq import AsyncGroq
+                self._groq_client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+            voice = self._voice or os.environ.get("WARROOM_GROQ_VOICE", "autumn")
+            model = os.environ.get("WARROOM_GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
+            measuring_ttfb = True
+            try:
+                response = await self._groq_client.audio.speech.create(
+                    model=model,
+                    voice=voice,
+                    response_format="wav",
+                    speed=1.0,
+                    input=text,
+                )
+                await self.start_tts_usage_metrics(text)
+                chunks = []
+                async for data in response.iter_bytes():
+                    if data and measuring_ttfb:
+                        await self.stop_ttfb_metrics()
+                        measuring_ttfb = False
+                    if data:
+                        chunks.append(data)
+                if not chunks:
+                    yield ErrorFrame(error="Groq TTS returned no audio")
+                    return
+                import io
+                import wave
+                with wave.open(io.BytesIO(b"".join(chunks))) as wav:
+                    channels = wav.getnchannels()
+                    frame_rate = wav.getframerate()
+                    audio = wav.readframes(wav.getnframes())
+                yield TTSAudioRawFrame(audio, frame_rate, channels, context_id=context_id)
+            except Exception as exc:
+                yield ErrorFrame(error=f"Groq TTS failed: {exc}")
+
+    return MixedProviderTTSService()
+
+
+async def run_mixed_mode():
+    """Groq Whisper STT → Claude bridge → per-agent TTS provider router."""
+    from pipecat.services.groq.stt import GroqSTTService
+    from router import AgentRouter
+    from agent_bridge import ClaudeAgentBridge
+
+    check_required_keys({
+        "GROQ_API_KEY": "Groq Whisper STT for War Room mixed provider",
+    })
+
+    port = int(os.environ.get("WARROOM_PORT", "7860"))
+    transport = make_transport(port)
+
+    stt = GroqSTTService(api_key=os.environ["GROQ_API_KEY"])
+    router = AgentRouter()
+    bridge = ClaudeAgentBridge(
+        provider_field="audio_provider",
+        default_provider=os.environ.get("WARROOM_MIXED_DEFAULT_PROVIDER", ""),
+    )
+    tts = _build_mixed_tts_service()
+
+    pipeline = Pipeline([
+        transport.input(),
+        stt,
+        router,
+        bridge,
+        tts,
+        transport.output(),
+    ])
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(allow_interruptions=True, enable_metrics=True),
+    )
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info("Client disconnected; keeping pipeline alive for next meeting")
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("Client connected (mixed mode)")
+
+    print_ready(port, "mixed")
+    runner = PipelineRunner(handle_sigterm=True)
+    logger.info("War Room MIXED mode on ws://0.0.0.0:%d (stt=groq, tts=per-agent)", port)
+    await runner.run(task)
+    logger.info("War Room session ended.")
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────
@@ -1289,6 +2041,9 @@ async def run_warroom():
         return
     if pinned_provider == "voxtral":
         await run_voxtral_mode()
+        return
+    if pinned_provider == "mixed":
+        await run_mixed_mode()
         return
     if pinned_provider == "gemini-live-25":
         # Override the model env so the live path picks the older fast model

@@ -347,6 +347,119 @@ async function synthesizeSpeechGradium(text: string): Promise<Buffer> {
   );
 }
 
+// ── TTS: Mistral Voxtral (zero-shot voice cloning) ──────────────────────────
+
+/**
+ * Convert text to speech using Mistral Voxtral TTS and return MP3 as Buffer.
+ *
+ * Voxtral returns JSON with the audio as base64 in `audio_data`, NOT a raw
+ * audio body — so we parse + decode here. With `ref_audio` (a path to a 10-30s
+ * sample), Voxtral does zero-shot voice cloning. Without it, falls back to a
+ * neutral preset voice. Used as fallback when ElevenLabs quota runs out.
+ *
+ * Docs: https://docs.mistral.ai/capabilities/audio/ (POST /v1/audio/speech)
+ */
+async function synthesizeSpeechVoxtral(text: string): Promise<Buffer> {
+  const env = readEnvFile([
+    'MISTRAL_API_KEY',
+    'VOXTRAL_TTS_MODEL',
+    'VOXTRAL_VOICE',
+    'VOXTRAL_REF_AUDIO',
+  ]);
+  const apiKey = env.MISTRAL_API_KEY;
+  if (!apiKey) throw new Error('MISTRAL_API_KEY not set');
+
+  const model = env.VOXTRAL_TTS_MODEL || 'voxtral-mini-tts-2603';
+
+  // The API requires EXACTLY ONE of `voice` (preset slug) or `ref_audio`
+  // (base64 sample for zero-shot cloning). Catalog has no PT-BR preset —
+  // for Portuguese we strongly prefer ref_audio. Without it, fall back to
+  // `en_paul_neutral` (English male) which speaks the input text with EN
+  // accent. The .env var name follows OpenAI convention (`voice`) so the
+  // mental model is closer to OpenAI TTS.
+  const payloadObj: Record<string, unknown> = {
+    model,
+    input: text,
+    response_format: 'mp3',
+  };
+
+  let usedRef = false;
+  if (env.VOXTRAL_REF_AUDIO) {
+    // Security: prevent arbitrary file exfiltration via VOXTRAL_REF_AUDIO.
+    // The .env var is editable by the dashboard PATCH /api/voice/config
+    // surface, so a prompt-injected agent or compromised endpoint could
+    // otherwise set it to /etc/passwd or ~/.ssh/id_rsa and have us
+    // base64-encode the contents into the Mistral payload.
+    //
+    // Allowlist:
+    //   - ~/.claudeclaw/   (where bench-warm.mjs and per-agent ref clips live)
+    //   - PROJECT_ROOT/    (where the repo's own assets live, e.g. tests)
+    //
+    // Resolves the real path (no symlinks) and verifies it is INSIDE one
+    // of those roots. Anything outside is rejected with a logged warning
+    // and the cascade falls back to a preset voice.
+    const allowedRoots = [
+      path.resolve(process.env.HOME ?? '/tmp', '.claudeclaw'),
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+    ];
+    let resolved: string | null = null;
+    try {
+      resolved = fs.realpathSync(env.VOXTRAL_REF_AUDIO);
+    } catch {
+      logger.warn({ path: env.VOXTRAL_REF_AUDIO }, 'Voxtral ref_audio cannot be resolved');
+    }
+    const underAllowedRoot = !!resolved
+      && allowedRoots.some((root) => resolved === root || resolved.startsWith(root + path.sep));
+    if (!underAllowedRoot) {
+      logger.warn(
+        { path: env.VOXTRAL_REF_AUDIO, resolved, allowedRoots },
+        'Voxtral ref_audio rejected: path outside allowed roots, using preset voice',
+      );
+    } else {
+      try {
+        const refBuf = fs.readFileSync(resolved!);
+        payloadObj.ref_audio = refBuf.toString('base64');
+        usedRef = true;
+      } catch (err) {
+        logger.warn({ err, path: resolved }, 'Voxtral ref_audio unreadable, falling back to preset voice');
+      }
+    }
+  }
+  if (!usedRef) {
+    payloadObj.voice = env.VOXTRAL_VOICE || 'en_paul_neutral';
+  }
+
+  const payload = JSON.stringify(payloadObj);
+  const respBuf = await httpsRequest(
+    'https://api.mistral.ai/v1/audio/speech',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Content-Length': Buffer.byteLength(payload).toString(),
+      },
+    },
+    payload,
+  );
+
+  // Voxtral always wraps audio in JSON: { audio_data: "<base64-mp3>" }.
+  // Errors come as { object: "error", message: "..." }. Parse, then decode
+  // base64 to a Buffer the bot can hand straight to ctx.replyWithVoice.
+  if (respBuf.length === 0) throw new Error('Voxtral returned empty body');
+  let json: { audio_data?: string; message?: string; object?: string };
+  try {
+    json = JSON.parse(respBuf.toString('utf-8'));
+  } catch {
+    throw new Error(`Voxtral returned non-JSON (len=${respBuf.length})`);
+  }
+  if (json.object === 'error' || !json.audio_data) {
+    throw new Error(`Voxtral error: ${json.message ?? respBuf.toString('utf-8').slice(0, 200)}`);
+  }
+  return Buffer.from(json.audio_data, 'base64');
+}
+
 // ── TTS: Local OpenAI-compatible (Kokoro) ────────────────────────────────────
 
 /**
@@ -434,20 +547,27 @@ export async function synthesizeSpeechLocal(text: string): Promise<Buffer> {
   }
 }
 
-// ── TTS: Cascade (ElevenLabs → Gradium → Kokoro → macOS say) ────────────────
+// ── TTS: Cascade (ElevenLabs → Voxtral → Gradium → Kokoro → macOS say) ──────
 
 /**
  * Convert text to speech using the first available provider.
- * Priority: ElevenLabs → Gradium AI → Kokoro (local) → macOS say + ffmpeg.
+ * Priority: ElevenLabs → Voxtral (Mistral) → Gradium AI → Kokoro (local)
+ * → macOS say + ffmpeg.
+ *
+ * Voxtral sits second so that when ElevenLabs hits quota_exceeded (free tier
+ * runs out of chars often) we still get a real cloud TTS before falling back
+ * to local.
  */
 export async function synthesizeSpeech(text: string): Promise<Buffer> {
   const env = readEnvFile([
     'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID',
+    'MISTRAL_API_KEY',
     'GRADIUM_API_KEY', 'GRADIUM_VOICE_ID',
     'KOKORO_URL',
   ]);
 
   const hasElevenLabs = !!(env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID);
+  const hasVoxtral = !!env.MISTRAL_API_KEY;
   const hasGradium = !!(env.GRADIUM_API_KEY && env.GRADIUM_VOICE_ID);
 
   if (hasElevenLabs) {
@@ -455,6 +575,14 @@ export async function synthesizeSpeech(text: string): Promise<Buffer> {
       return await synthesizeSpeechElevenLabs(text);
     } catch (err) {
       logger.warn({ err }, 'ElevenLabs TTS failed, trying next provider');
+    }
+  }
+
+  if (hasVoxtral) {
+    try {
+      return await synthesizeSpeechVoxtral(text);
+    } catch (err) {
+      logger.warn({ err }, 'Voxtral TTS failed, trying next provider');
     }
   }
 
@@ -489,6 +617,7 @@ export function voiceCapabilities(): { stt: boolean; tts: boolean } {
     'GROQ_API_KEY',
     'WHISPER_MODEL_PATH',
     'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID',
+    'MISTRAL_API_KEY',
     'GRADIUM_API_KEY', 'GRADIUM_VOICE_ID',
     'KOKORO_URL',
   ]);
@@ -496,6 +625,7 @@ export function voiceCapabilities(): { stt: boolean; tts: boolean } {
   return {
     stt: !!env.GROQ_API_KEY || !!env.WHISPER_MODEL_PATH,
     tts: !!(env.ELEVENLABS_API_KEY && env.ELEVENLABS_VOICE_ID)
+      || !!env.MISTRAL_API_KEY
       || !!(env.GRADIUM_API_KEY && env.GRADIUM_VOICE_ID)
       || !!env.KOKORO_URL
       || process.platform === 'darwin',
