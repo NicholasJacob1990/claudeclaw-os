@@ -14,12 +14,14 @@
 // land BEFORE config.ts evaluates at import time.
 
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import fs from 'fs';
 import { _initTestDatabase } from './db.js';
 import { buildDashboardApp } from './dashboard.js';
 import type { Hono } from 'hono';
 
 const TOKEN = 'test-contract-token';
 const Q = '?token=' + TOKEN;
+const WARROOM_PROVIDER_PATH = '/tmp/warroom-provider.json';
 
 let app: Hono;
 
@@ -567,6 +569,47 @@ describe('GET /api/warroom/pin', () => {
       ok: expect.any(Boolean),
       mode: expect.any(String),
     });
+  });
+});
+
+describe('War Room audio provider contract', () => {
+  it('accepts mixed provider for per-agent TTS routing', async () => {
+    const previousProviderPin = fs.existsSync(WARROOM_PROVIDER_PATH)
+      ? fs.readFileSync(WARROOM_PROVIDER_PATH, 'utf-8')
+      : null;
+    try {
+      const res = await app.request('/api/warroom/provider' + Q, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: 'mixed', restart: false }),
+      });
+      expect(res.status).toBe(200);
+      const body = await jsonOf(res);
+      expect(body).toMatchObject({ ok: true, provider: 'mixed' });
+    } finally {
+      if (previousProviderPin === null) {
+        try { fs.unlinkSync(WARROOM_PROVIDER_PATH); } catch { /* absent is ok */ }
+      } else {
+        fs.writeFileSync(WARROOM_PROVIDER_PATH, previousProviderPin, 'utf-8');
+      }
+    }
+  });
+
+  it('returns per-agent provider and provider-specific voice fields', async () => {
+    const res = await get('/api/warroom/voices');
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body.voices[0]).toMatchObject({
+      audio_provider: expect.any(String),
+      gemini_voice: expect.any(String),
+      xai_voice: expect.any(String),
+      elevenlabs_voice_id: expect.any(String),
+      voxtral_voice_id: expect.any(String),
+      voxtral_ref_audio_path: expect.any(String),
+      groq_voice: expect.any(String),
+    });
+    expect(Array.isArray(body.groq_catalog)).toBe(true);
+    expect(body.groq_catalog.length).toBeGreaterThan(0);
   });
 });
 

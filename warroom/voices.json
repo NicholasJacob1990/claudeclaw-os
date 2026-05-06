@@ -1,33 +1,80 @@
 {
   "main": {
+    "audio_provider": "",
     "voice_id": "a0e99841-438c-4a64-b679-ae501e7d6091",
     "gemini_voice": "Charon",
     "xai_voice": "Eve",
+    "elevenlabs_voice_id": "",
+    "voxtral_voice_id": "",
+    "voxtral_ref_audio_path": "",
     "name": "Charon / British Male (informative, confident)",
-    "language": null
+    "language": null,
+    "groq_voice": "Quinn-PlayAI"
   },
   "research": {
+    "audio_provider": "",
     "voice_id": "bf991597-6c13-47e4-8411-91ec2de5c466",
     "gemini_voice": "Kore",
+    "xai_voice": "Ara",
+    "elevenlabs_voice_id": "",
+    "voxtral_voice_id": "",
+    "voxtral_ref_audio_path": "",
     "name": "Kore / American Female (firm, analytical)",
-    "language": null
+    "language": null,
+    "groq_voice": "Arista-PlayAI"
   },
   "comms": {
+    "audio_provider": "",
     "voice_id": "c2ac25f9-ecc4-4f56-9095-651354df60c0",
     "gemini_voice": "Aoede",
+    "xai_voice": "Leo",
+    "elevenlabs_voice_id": "",
+    "voxtral_voice_id": "",
+    "voxtral_ref_audio_path": "",
     "name": "Aoede / American Male (breezy, warm)",
-    "language": null
+    "language": null,
+    "groq_voice": "Basil-PlayAI"
   },
   "content": {
+    "audio_provider": "",
     "voice_id": "a01c369f-6d2d-4185-bc20-b32c225eab70",
     "gemini_voice": "Leda",
+    "xai_voice": "Rex",
+    "elevenlabs_voice_id": "",
+    "voxtral_voice_id": "",
+    "voxtral_ref_audio_path": "",
     "name": "Leda / British Female (youthful, creative)",
-    "language": null
+    "language": null,
+    "groq_voice": "Briggs-PlayAI"
   },
   "ops": {
+    "audio_provider": "",
     "voice_id": "2ee87190-8f84-4925-97da-e52547f9462c",
     "gemini_voice": "Alnilam",
+    "xai_voice": "Sal",
+    "elevenlabs_voice_id": "",
+    "voxtral_voice_id": "",
+    "voxtral_ref_audio_path": "",
     "name": "Alnilam / American Male (firm, direct)",
-    "language": null
+    "language": null,
+    "groq_voice": "Calum-PlayAI"
+  },
+  "advogado": {
+    "audio_provider": "",
+    "gemini_voice": "Umbriel",
+    "xai_voice": "Leo",
+    "elevenlabs_voice_id": "",
+    "voxtral_voice_id": "",
+    "voxtral_ref_audio_path": "",
+    "groq_voice": "Fritz-PlayAI"
+  },
+  "pesquisador": {
+    "audio_provider": "",
+    "gemini_voice": "Aoede",
+    "xai_voice": "Ara",
+    "elevenlabs_voice_id": "",
+    "voxtral_voice_id": "",
+    "voxtral_ref_audio_path": "",
+    "groq_voice": "Celeste-PlayAI"
   }
 }

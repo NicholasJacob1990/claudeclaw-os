@@ -90,7 +90,7 @@ import {
   suggestBotNames,
   isAgentRunning,
 } from './agent-create.js';
-import { getMainModelOverride, processMessageFromDashboard } from './bot.js';
+import { getMainModelOverride, getMainRuntimeOverride, processMessageFromDashboard } from './bot.js';
 import { getDashboardHtml } from './dashboard-html.js';
 import { getWarRoomHtml } from './warroom-html.js';
 import { getWarRoomPickerHtml } from './warroom-text-picker-html.js';
@@ -111,7 +111,7 @@ import { getIngestionQuotaStatus, extractViaClaude } from './memory-ingest.js';
 import { WARROOM_ENABLED, WARROOM_PORT } from './config.js';
 import { logger } from './logger.js';
 import { getTelegramConnected, getBotInfo, chatEvents, getIsProcessing, abortActiveQuery, ChatEvent } from './state.js';
-import { killProcess, isProcessAlive, findProcessesByPattern } from './platform.js';
+import { killProcess, isProcessAlive, findListeningPidsByPort, findProcessesByPattern } from './platform.js';
 
 async function classifyTaskAgent(prompt: string): Promise<string | null> {
   const agentIds = listAgentIds();
@@ -577,6 +577,40 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // in src/warroom-html.ts always has a `window.location.hostname`
   // fallback, so just returning {ok:true} lets the browser build the
   // right WS url on its own.
+  async function probeWarRoomWebSocket(timeoutMs = 3000): Promise<boolean> {
+    const wsModule: any = await import('ws');
+    const WS = wsModule.default?.WebSocket ?? wsModule.WebSocket;
+    let remote: any = null;
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          if (remote && remote.readyState <= 1) remote.close(1000, 'dashboard readiness probe');
+        } catch { /* ok */ }
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      try {
+        remote = new WS(`ws://127.0.0.1:${WARROOM_PORT}`);
+        remote.once('open', () => finish(true));
+        remote.once('error', () => finish(false));
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  async function waitForWarRoomWebSocket(attempts: number, delayMs: number): Promise<boolean> {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (await probeWarRoomWebSocket()) return true;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+    return false;
+  }
+
   app.post('/api/warroom/start', async (c) => {
     if (!WARROOM_ENABLED) {
       return c.json({ error: 'War Room not enabled. Set WARROOM_ENABLED=true in .env with GOOGLE_API_KEY (for live mode) or DEEPGRAM_API_KEY + CARTESIA_API_KEY (for legacy mode).' }, 400);
@@ -586,56 +620,38 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     if (!killSwitches.isEnabled('WARROOM_VOICE_ENABLED')) {
       return c.json({ error: 'voice war room disabled' }, 503);
     }
-    // If the pin file was updated recently (agent switch while no meeting
-    // was active), the running server has the wrong agent. Kill it so it
-    // restarts with the correct persona/voice before we probe readiness.
+    // If the pin file was updated VERY recently, the running server still
+    // has the old pin and we need to force a respawn before probing. The
+    // window is small (3s) on purpose: the front-end polls /api/warroom/start
+    // every 500ms during a meeting agent switch, and an over-wide window
+    // makes every poll re-kill the freshly-respawned subprocess. 3s is more
+    // than enough. Readiness must be a real WebSocket handshake, not just
+    // TCP connect: Pipecat can bind the port while its upgrade handler still
+    // returns 403, which made the browser start too early and immediately
+    // fall into reconnect/disconnect loops.
     try {
       const pinStat = fs.statSync(WARROOM_PIN_PATH);
       const pinAge = Date.now() - pinStat.mtimeMs;
-      if (pinAge < 30000) {
-        // Pin changed in the last 30 seconds. Kill the server so it
-        // picks up the new pin, then poll until it's ready.
+      if (pinAge < 3000) {
         await killWarroomAsync('pin changed recently, restarting for Start Meeting');
-        const net = await import('net');
-        let serverReady = false;
-        for (let attempt = 0; attempt < 15 && !serverReady; attempt++) {
-          await new Promise((r) => setTimeout(r, 1000));
-          serverReady = await new Promise<boolean>((resolve) => {
-            const sock = new net.Socket();
-            const t = setTimeout(() => { sock.destroy(); resolve(false); }, 1000);
-            sock.connect(WARROOM_PORT, '127.0.0.1', () => { clearTimeout(t); sock.destroy(); resolve(true); });
-            sock.on('error', () => { clearTimeout(t); sock.destroy(); resolve(false); });
-          });
-        }
+        const serverReady = await waitForWarRoomWebSocket(20, 750);
         if (serverReady) {
-          await new Promise((r) => setTimeout(r, 200));
+          await new Promise((r) => setTimeout(r, 300));
           return c.json({ ok: true, status: 'ready' });
         }
         return c.json({ ok: false, status: 'starting', error: 'War Room server restarting, try again' }, 503);
       }
     } catch { /* pin file might not exist yet, that's fine */ }
 
-    // Probe the Python WebSocket server to verify it's actually accepting
-    // connections. Without this, the browser connects before the server is
-    // ready and gets silent failures or "only one client allowed" errors.
+    // Probe the Python WebSocket server with a real upgrade handshake.
+    // A plain TCP connect is not sufficient: the process can have the port
+    // open while the WebSocket server still returns 403 during startup.
     try {
-      const net = await import('net');
-      const ready = await new Promise<boolean>((resolve) => {
-        const sock = new net.Socket();
-        const timer = setTimeout(() => { sock.destroy(); resolve(false); }, 3000);
-        sock.connect(WARROOM_PORT, '127.0.0.1', () => {
-          clearTimeout(timer);
-          sock.destroy();
-          resolve(true);
-        });
-        sock.on('error', () => { clearTimeout(timer); sock.destroy(); resolve(false); });
-      });
+      const ready = await waitForWarRoomWebSocket(6, 500);
       if (!ready) {
         return c.json({ ok: false, status: 'starting', error: 'War Room server not ready yet' }, 503);
       }
-      // Small delay after TCP success: the socket may be bound but the
-      // Pipecat WebSocket upgrade handler might not be fully initialized.
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 300));
     } catch {
       return c.json({ ok: false, status: 'starting', error: 'Could not probe War Room server' }, 503);
     }
@@ -695,7 +711,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // file's mtime and reloads only when it changes. Spoken agent prefixes
   // (e.g. "research, find X") still take precedence over the pin.
   const WARROOM_PIN_PATH = '/tmp/warroom-pin.json';
-  const VALID_PIN_MODES = new Set(['direct', 'auto']);
+  const VALID_PIN_MODES = new Set(['direct', 'auto', 'router', 'single', 'broadcast', 'debate', 'ensemble', 'consensus']);
   // Recompute on every call so newly-created agents become pinnable
   // without a dashboard restart. listAgentIds() reads the agent-configs
   // directory which the agent-create flow writes to synchronously.
@@ -727,10 +743,12 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // so the HTTP response doesn't block on the respawn.
   async function killWarroomAsync(reason: string): Promise<number[]> {
     try {
-      const pids = await findProcessesByPattern('warroom/server.py');
+      const patternPids = await findProcessesByPattern('warroom/server.py');
+      const portPids = findListeningPidsByPort(WARROOM_PORT);
+      const pids = [...new Set([...patternPids, ...portPids])];
       for (const pid of pids) killProcess(pid);
       if (pids.length > 0) {
-        logger.info({ pids, reason }, 'Killed warroom subprocess for respawn');
+        logger.info({ pids, patternPids, portPids, port: WARROOM_PORT, reason }, 'Killed warroom subprocess/listeners for respawn');
       }
       return pids;
     } catch (err) {
@@ -750,11 +768,12 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const nextAgent = body.agent !== undefined ? body.agent : (current.agent ?? 'main');
     const nextMode = body.mode !== undefined ? body.mode : current.mode;
 
-    if (!getValidPinAgents().has(nextAgent)) {
-      return c.json({ ok: false, error: 'invalid agent; must be one of main, research, comms, content, ops' }, 400);
+    const validAgents = getValidPinAgents();
+    if (!validAgents.has(nextAgent)) {
+      return c.json({ ok: false, error: `invalid agent; must be one of ${[...validAgents].sort().join(', ')}` }, 400);
     }
     if (!VALID_PIN_MODES.has(nextMode)) {
-      return c.json({ ok: false, error: 'invalid mode; must be one of direct, auto' }, 400);
+      return c.json({ ok: false, error: 'invalid mode; must be one of direct, auto, router, single, broadcast, debate, ensemble, consensus' }, 400);
     }
 
     try {
@@ -1320,8 +1339,9 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     'xai',             // xAI Grok Voice Agent (E2E, voices Ara/Eve/Leo/Rex/Sal)
     'groq',            // Groq Whisper + Claude + Groq PlayAI
     'cartesia',        // Deepgram + Claude + Cartesia (legacy stitched)
-    'elevenlabs',      // Groq Whisper STT + Claude + ElevenLabs TTS (voice-cloned via .env voice id)
-    'voxtral',         // Mistral Voxtral realtime STT (sub-200ms WS) + Claude + Voxtral TTS streaming (zero-shot ref_audio)
+    'elevenlabs',      // Groq Whisper STT + Claude + ElevenLabs TTS (per-agent voice id)
+    'voxtral',         // Mistral Voxtral realtime STT + Claude + Voxtral TTS/ref-audio
+    'mixed',           // Groq Whisper STT + Claude + per-agent TTS provider routing
   ]);
 
   function readProviderState(): { provider: string | null } {
@@ -1368,9 +1388,14 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   });
 
   // ── War Room voice configuration ──
-  // warroom/voices.json carries two voice identifiers per agent:
-  //   - gemini_voice:     Gemini Live's built-in voice name (used in live mode)
-  //   - voice_id:         Cartesia voice id (used in legacy stitched mode)
+  // warroom/voices.json carries provider-specific voice identifiers per agent:
+  //   - gemini_voice:            Gemini Live's built-in voice name
+  //   - xai_voice:               xAI Grok realtime voice name
+  //   - voice_id:                Cartesia voice id (legacy stitched mode)
+  //   - elevenlabs_voice_id:     ElevenLabs voice id
+  //   - voxtral_voice_id:        Mistral/Voxtral saved voice id
+  //   - groq_voice:              Groq PlayAI voice name (e.g. Atlas-PlayAI)
+  //   - voxtral_ref_audio_path:  local ref-audio path for Voxtral zero-shot voice
   // The Python server reads this file on startup. After editing via the
   // dashboard, POST /api/warroom/voices/apply kickstarts the main agent so
   // its child warroom process respawns with the new config.
@@ -1424,6 +1449,34 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   ];
   const XAI_VOICE_NAMES = new Set(XAI_VOICE_CATALOG.map((v) => v.name));
 
+  // Groq PlayAI voices (Text-to-Speech / playai-tts model). 19 voices, all
+  // English, served via Groq's hosted PlayAI integration.
+  // https://console.groq.com/docs/text-to-speech
+  // Used when audio_provider === 'groq'. Groq mode pairs Whisper STT +
+  // Claude (or any LLM) + PlayAI TTS in a stitched pipeline.
+  const GROQ_VOICE_CATALOG = [
+    { name: 'Arista-PlayAI', style: 'professional female' },
+    { name: 'Atlas-PlayAI', style: 'authoritative male' },
+    { name: 'Basil-PlayAI', style: 'warm male' },
+    { name: 'Briggs-PlayAI', style: 'gravelly male' },
+    { name: 'Calum-PlayAI', style: 'casual male' },
+    { name: 'Celeste-PlayAI', style: 'warm female' },
+    { name: 'Cheyenne-PlayAI', style: 'youthful female' },
+    { name: 'Chip-PlayAI', style: 'energetic male' },
+    { name: 'Cillian-PlayAI', style: 'expressive male' },
+    { name: 'Deedee-PlayAI', style: 'cheerful female' },
+    { name: 'Fritz-PlayAI', style: 'confident male' },
+    { name: 'Gail-PlayAI', style: 'mature female' },
+    { name: 'Indigo-PlayAI', style: 'sultry female' },
+    { name: 'Mamaw-PlayAI', style: 'elderly female' },
+    { name: 'Mason-PlayAI', style: 'friendly male' },
+    { name: 'Mikail-PlayAI', style: 'smooth male' },
+    { name: 'Mitch-PlayAI', style: 'bold male' },
+    { name: 'Quinn-PlayAI', style: 'neutral non-binary' },
+    { name: 'Thunder-PlayAI', style: 'deep male' },
+  ];
+  const GROQ_VOICE_NAMES = new Set(GROQ_VOICE_CATALOG.map((v) => v.name));
+
   // Default voice assignments for agents that don't have an entry yet.
   // This is how a newly-spawned sub-agent gets a voice without any extra
   // setup. We skip Charon (reserved for main) so new agents always sound
@@ -1433,7 +1486,20 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     'Fenrir', 'Laomedeia', 'Achird', 'Sulafat', 'Vindemiatrix',
   ];
 
-  function readVoicesFile(): Record<string, { voice_id?: string; gemini_voice?: string; xai_voice?: string; name?: string }> {
+  type WarRoomVoiceConfig = {
+    audio_provider?: string;
+    voice_id?: string;
+    gemini_voice?: string;
+    xai_voice?: string;
+    elevenlabs_voice_id?: string;
+    voxtral_voice_id?: string;
+    voxtral_ref_audio_path?: string;
+    groq_voice?: string;
+    name?: string;
+    language?: string | null;
+  };
+
+  function readVoicesFile(): Record<string, WarRoomVoiceConfig> {
     try {
       return JSON.parse(fs.readFileSync(WARROOM_VOICES_PATH, 'utf-8'));
     } catch {
@@ -1476,10 +1542,21 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       const xaiPool = ['Ara', 'Eve', 'Leo', 'Rex', 'Sal'];
       const idx = knownAgents.indexOf(agent);
       const xaiVoice = entry.xai_voice || xaiPool[idx % xaiPool.length];
+      // Groq default rotates through the PlayAI catalog. Main gets
+      // Atlas-PlayAI (authoritative male) so it's distinct from main's
+      // Charon Gemini default.
+      const groqPool = GROQ_VOICE_CATALOG.map((v) => v.name);
+      const groqVoice = entry.groq_voice
+        || (agent === 'main' ? 'Atlas-PlayAI' : groqPool[idx % groqPool.length]);
       return {
         agent,
+        audio_provider: entry.audio_provider || '',
         gemini_voice: geminiVoice,
         xai_voice: xaiVoice,
+        elevenlabs_voice_id: entry.elevenlabs_voice_id || '',
+        voxtral_voice_id: entry.voxtral_voice_id || '',
+        voxtral_ref_audio_path: entry.voxtral_ref_audio_path || '',
+        groq_voice: groqVoice,
         voice_id: entry.voice_id || '',
         name: entry.name || '',
         is_default: isDefault,
@@ -1490,15 +1567,16 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       voices: rows,
       gemini_catalog: GEMINI_VOICE_CATALOG,
       xai_catalog: XAI_VOICE_CATALOG,
+      groq_catalog: GROQ_VOICE_CATALOG,
     });
   });
 
   app.post('/api/warroom/voices', async (c) => {
-    let body: { updates?: Array<{ agent: string; gemini_voice?: string; xai_voice?: string; voice_id?: string; name?: string }> } = {};
+    let body: { updates?: Array<WarRoomVoiceConfig & { agent: string }> } = {};
     try { body = await c.req.json(); } catch { /* empty */ }
     const updates = body.updates;
     if (!Array.isArray(updates) || updates.length === 0) {
-      return c.json({ ok: false, error: 'updates must be a non-empty array of {agent, gemini_voice?, xai_voice?, voice_id?, name?}' }, 400);
+      return c.json({ ok: false, error: 'updates must be a non-empty array of {agent, audio_provider?, gemini_voice?, xai_voice?, elevenlabs_voice_id?, voxtral_voice_id?, voxtral_ref_audio_path?, groq_voice?, voice_id?, name?}' }, 400);
     }
 
     const configured = readVoicesFile();
@@ -1509,6 +1587,18 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         continue;
       }
       const entry = configured[u.agent] || {};
+      if (u.audio_provider !== undefined) {
+        if (typeof u.audio_provider !== 'string') {
+          errors.push(`${u.agent}: audio_provider must be a string`);
+          continue;
+        }
+        const provider = u.audio_provider.trim();
+        if (provider && !['xai', 'elevenlabs', 'voxtral', 'groq'].includes(provider)) {
+          errors.push(`${u.agent}: invalid audio_provider '${u.audio_provider}' (must be xai, elevenlabs, voxtral, groq, or empty)`);
+          continue;
+        }
+        entry.audio_provider = provider;
+      }
       if (u.gemini_voice !== undefined) {
         if (typeof u.gemini_voice !== 'string' || !GEMINI_VOICE_NAMES.has(u.gemini_voice)) {
           errors.push(`${u.agent}: invalid gemini_voice '${u.gemini_voice}' (must be one of the 30 Gemini voices)`);
@@ -1529,6 +1619,36 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
           continue;
         }
         entry.voice_id = u.voice_id;
+      }
+      if (u.elevenlabs_voice_id !== undefined) {
+        if (typeof u.elevenlabs_voice_id !== 'string') {
+          errors.push(`${u.agent}: elevenlabs_voice_id must be a string`);
+          continue;
+        }
+        entry.elevenlabs_voice_id = u.elevenlabs_voice_id.trim();
+      }
+      if (u.voxtral_voice_id !== undefined) {
+        if (typeof u.voxtral_voice_id !== 'string') {
+          errors.push(`${u.agent}: voxtral_voice_id must be a string`);
+          continue;
+        }
+        entry.voxtral_voice_id = u.voxtral_voice_id.trim();
+      }
+      if (u.voxtral_ref_audio_path !== undefined) {
+        if (typeof u.voxtral_ref_audio_path !== 'string') {
+          errors.push(`${u.agent}: voxtral_ref_audio_path must be a string`);
+          continue;
+        }
+        entry.voxtral_ref_audio_path = u.voxtral_ref_audio_path.trim();
+      }
+      if (u.groq_voice !== undefined) {
+        // Empty string clears the override (back to default rotation).
+        const trimmed = typeof u.groq_voice === 'string' ? u.groq_voice.trim() : '';
+        if (trimmed && !GROQ_VOICE_NAMES.has(trimmed)) {
+          errors.push(`${u.agent}: invalid groq_voice '${u.groq_voice}' (must be one of the 19 PlayAI voices)`);
+          continue;
+        }
+        entry.groq_voice = trimmed;
       }
       if (u.name !== undefined) {
         if (typeof u.name !== 'string') {
@@ -2050,9 +2170,10 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       } catch { /* not running */ }
     }
     const mainStats = getAgentTokenStats('main');
-    // Main has no agent.yaml; default runtime claude. If main ever gets one
-    // (e.g. user wants main on codex CLI), this should switch to loadAgentConfig.
-    const mainRuntime = 'claude' as const;
+    // Main has no agent.yaml on disk. Runtime is held in-memory by
+    // bot.ts (chatRuntimeOverride) and inferred from the model prefix when
+    // setMainModelOverride runs. Falls back to 'claude' on first boot.
+    const mainRuntime = getMainRuntimeOverride() ?? 'claude';
     const allAgents = [
       { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-7', runtime: mainRuntime, running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
       ...agents,
@@ -2119,12 +2240,21 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       return c.json({ error: `Invalid runtime. Valid: ${VALID_RUNTIMES.join(', ')}` }, 400);
     }
     try {
+      if (agentId === 'main') {
+        // Main has no agent.yaml — runtime lives in-memory in bot.ts.
+        // openai-sdk/gemini-sdk paths are not exposed for main since the
+        // user's policy is CLI-only; reject anything but claude/codex/gemini.
+        if (runtime !== 'claude' && runtime !== 'codex' && runtime !== 'gemini') {
+          return c.json({ error: `main runtime must be claude|codex|gemini (CLI-only)` }, 400);
+        }
+        const { setMainRuntimeOverride } = await import('./bot.js');
+        setMainRuntimeOverride(runtime);
+        return c.json({ ok: true, agent: agentId, runtime, restartRequired: false });
+      }
       setAgentRuntime(agentId, runtime);
-      // Main reads runtime via loadAgentConfig at every runAgent call (no
-      // cache), so it picks up the change on the next turn — no restart
-      // needed. Sub-agents would need the .yaml re-read on next process
-      // boot, hence restartRequired flag for clarity in the UI.
-      return c.json({ ok: true, agent: agentId, runtime, restartRequired: agentId !== 'main' });
+      // Sub-agents would need the .yaml re-read on next process boot, hence
+      // restartRequired flag for clarity in the UI.
+      return c.json({ ok: true, agent: agentId, runtime, restartRequired: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to update runtime';
       return c.json({ error: msg }, 500);
