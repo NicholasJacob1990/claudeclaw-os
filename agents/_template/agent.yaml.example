@@ -15,11 +15,19 @@ description: What this agent does
 telegram_bot_token_env: MYAGENT_BOT_TOKEN
 
 # Runtime backend. Choose which CLI/SDK powers this agent:
-#   claude (default) — Claude Code Agent SDK; full skills + MCPs from ~/.claude/
-#   codex            — Codex CLI (OpenAI); auto-loads ~/.codex/AGENTS.md + skills
-#   gemini           — Gemini CLI (Google); auto-loads ~/.gemini/extensions
-# Each runtime brings its own tool/skill stack from $HOME, so install the
-# CLIs you want before pointing an agent at them.
+#   claude       (default) Claude Agent SDK; skills/MCPs ~/.claude/
+#   codex                  Codex CLI subprocess; ~/.codex/AGENTS.md + skills
+#   gemini                 Gemini CLI subprocess; ~/.gemini/extensions
+#   openai-sdk             @openai/agents in-process — HOSTED TOOLS:
+#                          web_search_preview, file_search, code_interpreter
+#                          (requer OPENAI_API_KEY no .env)
+#   gemini-sdk             @google/genai in-process — Google Search grounding
+#                          + code_execution + thinking config
+#                          (requer GEMINI_API_KEY ou GOOGLE_API_KEY no .env)
+#
+# CLIs (codex/gemini) carregam skills/MCPs do user existentes em $HOME.
+# SDKs (openai-sdk/gemini-sdk) dão hosted tools que CLIs não expõem mas
+# NÃO carregam skills locais.
 runtime: claude
 
 # Default model. Options:

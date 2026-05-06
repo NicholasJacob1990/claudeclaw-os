@@ -14,7 +14,7 @@ import { spawn } from 'child_process';
 import { logger } from './logger.js';
 import type { AgentResult, UsageInfo } from './agent.js';
 
-export type RuntimeId = 'claude' | 'codex' | 'gemini';
+export type RuntimeId = 'claude' | 'codex' | 'gemini' | 'openai-sdk' | 'gemini-sdk';
 
 export interface RuntimeRunInput {
   message: string;
@@ -138,24 +138,176 @@ export async function runGeminiRuntime(input: RuntimeRunInput): Promise<RuntimeR
 }
 
 /**
- * Adapter front-door used by `agent.ts:runAgent` when `agent.runtime` is
- * not 'claude'. Returns a minimal subset of AgentResult that matches what
- * the Telegram dispatch path actually consumes (text + usage + aborted).
+ * OpenAI Agents SDK runtime — uses @openai/agents in-process. Unlike the
+ * Codex CLI path, this gets HOSTED TOOLS (web_search_preview, file_search,
+ * code_interpreter) that exist only in the Responses API. No subprocess
+ * overhead. Skills from ~/.codex/ are NOT loaded (separate config domain).
  *
- * Skills/MCPs/permissions are intentionally NOT re-projected — each CLI
- * loads its own config from $HOME, so the user's existing setup just works.
- * If you need a tool to be available to all 3 runtimes, install the MCP
- * in all three CLI configs (~/.claude/mcp.json, ~/.codex/config.toml,
- * ~/.gemini/extensions/).
+ * Default model: env OPENAI_DEFAULT_MODEL or 'gpt-4.1'. Hosted tools opt-in
+ * via env OPENAI_HOSTED_TOOLS='web_search,file_search,code_interpreter'
+ * (comma-separated, names match Responses API tool types).
+ *
+ * Lazy-imports @openai/agents so the rest of the app doesn't require it
+ * when only claude/codex/gemini-cli are in use.
+ */
+export async function runOpenAISdkRuntime(input: RuntimeRunInput): Promise<RuntimeRunResult> {
+  let agentsLib: typeof import('@openai/agents');
+  try {
+    agentsLib = await import('@openai/agents');
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : String(err) }, '@openai/agents not installed');
+    return {
+      text: '[runtime error: @openai/agents not installed. Run: npm i @openai/agents]',
+      usage: null, aborted: false,
+    };
+  }
+
+  const apiKey = input.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return {
+      text: '[runtime error: OPENAI_API_KEY not set in .env]',
+      usage: null, aborted: false,
+    };
+  }
+
+  // Hosted tools opt-in via env. Each name maps to a Responses API tool type.
+  const enabledHostedTools = (input.env.OPENAI_HOSTED_TOOLS || '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  const hostedTools: Array<Record<string, unknown>> = [];
+  if (enabledHostedTools.includes('web_search')) hostedTools.push({ type: 'web_search_preview' });
+  if (enabledHostedTools.includes('file_search')) hostedTools.push({ type: 'file_search' });
+  if (enabledHostedTools.includes('code_interpreter')) hostedTools.push({ type: 'code_interpreter', container: { type: 'auto' } });
+
+  const model = input.env.OPENAI_DEFAULT_MODEL || 'gpt-4.1';
+  const { Agent, run } = agentsLib;
+
+  try {
+    const agent = new Agent({
+      name: 'CC-OS Agent (OpenAI SDK)',
+      instructions: 'Você é um assistente. Responda de forma concisa e útil em português brasileiro.',
+      model,
+      // Casting to the lib's expected tool shape — hosted tools have a
+      // looser contract than locally-defined ones.
+      tools: hostedTools as never,
+    });
+    // Process env precisa ter OPENAI_API_KEY pra SDK pegar. Set inline
+    // antes do run pra evitar pollution global.
+    const previousKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = apiKey;
+    try {
+      const result = await run(agent, input.message, {
+        // signal intentionally typed as `unknown`-cast — Agents SDK accepts
+        // AbortSignal in newer versions but typing varies between minor
+        // releases. Cast keeps us forward-compatible.
+        signal: input.abortController?.signal as never,
+      });
+      return {
+        text: typeof result.finalOutput === 'string' ? result.finalOutput : JSON.stringify(result.finalOutput ?? ''),
+        usage: null, aborted: false,
+      };
+    } finally {
+      if (previousKey !== undefined) process.env.OPENAI_API_KEY = previousKey;
+      else delete process.env.OPENAI_API_KEY;
+    }
+  } catch (err) {
+    if (input.abortController?.signal.aborted) {
+      return { text: null, usage: null, aborted: true };
+    }
+    logger.error({ err: err instanceof Error ? err.message : String(err) }, 'OpenAI SDK runtime error');
+    return {
+      text: `[OpenAI SDK error: ${err instanceof Error ? err.message : String(err)}]`,
+      usage: null, aborted: false,
+    };
+  }
+}
+
+/**
+ * Google Gen AI SDK runtime — uses @google/genai in-process. Different from
+ * Gemini CLI path: gets GROUNDING (Google Search), code_execution sandbox,
+ * Files API with vector store, thinking config. CLI doesn't expose these.
+ *
+ * Default model: env GEMINI_DEFAULT_MODEL or 'gemini-2.5-pro'. Grounding
+ * opt-in via env GEMINI_USE_GROUNDING=true. code_execution opt-in via
+ * GEMINI_USE_CODE_EXEC=true. Thinking budget via GEMINI_THINKING_BUDGET.
+ */
+export async function runGeminiSdkRuntime(input: RuntimeRunInput): Promise<RuntimeRunResult> {
+  let genAiLib: typeof import('@google/genai');
+  try {
+    genAiLib = await import('@google/genai');
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : String(err) }, '@google/genai not installed');
+    return {
+      text: '[runtime error: @google/genai not installed. Run: npm i @google/genai]',
+      usage: null, aborted: false,
+    };
+  }
+
+  const apiKey = input.env.GEMINI_API_KEY || input.env.GOOGLE_API_KEY;
+  if (!apiKey) {
+    return {
+      text: '[runtime error: GEMINI_API_KEY (ou GOOGLE_API_KEY) not set in .env]',
+      usage: null, aborted: false,
+    };
+  }
+
+  const useGrounding = (input.env.GEMINI_USE_GROUNDING || '').toLowerCase() === 'true';
+  const useCodeExec = (input.env.GEMINI_USE_CODE_EXEC || '').toLowerCase() === 'true';
+  const thinkingBudgetRaw = input.env.GEMINI_THINKING_BUDGET;
+  const thinkingBudget = thinkingBudgetRaw ? parseInt(thinkingBudgetRaw, 10) : undefined;
+
+  const model = input.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-pro';
+  const { GoogleGenAI } = genAiLib;
+
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const tools: Array<Record<string, unknown>> = [];
+    if (useGrounding) tools.push({ googleSearch: {} });
+    if (useCodeExec)  tools.push({ codeExecution: {} });
+
+    const config: Record<string, unknown> = {};
+    if (tools.length > 0) config.tools = tools;
+    if (thinkingBudget !== undefined && !Number.isNaN(thinkingBudget)) {
+      config.thinkingConfig = { thinkingBudget };
+    }
+
+    const response = await ai.models.generateContent({
+      model,
+      contents: input.message,
+      config: Object.keys(config).length > 0 ? config : undefined,
+    });
+
+    const text = response.text ?? null;
+    return { text, usage: null, aborted: false };
+  } catch (err) {
+    if (input.abortController?.signal.aborted) {
+      return { text: null, usage: null, aborted: true };
+    }
+    logger.error({ err: err instanceof Error ? err.message : String(err) }, 'Gemini SDK runtime error');
+    return {
+      text: `[Gemini SDK error: ${err instanceof Error ? err.message : String(err)}]`,
+      usage: null, aborted: false,
+    };
+  }
+}
+
+/**
+ * Adapter front-door used by `agent.ts:runAgent` when `agent.runtime` is
+ * not 'claude'. Routes to the right adapter — CLI subprocess for codex/gemini
+ * (uses local CLI config + skills) or in-process SDK for openai-sdk/gemini-sdk
+ * (gets hosted tools that CLIs don't expose).
  */
 export async function runNonClaudeRuntime(
   runtime: Exclude<RuntimeId, 'claude'>,
   input: RuntimeRunInput,
 ): Promise<AgentResult> {
   logger.info({ runtime, cwd: input.cwd }, 'Running non-Claude agent runtime');
-  const result = runtime === 'codex'
-    ? await runCodexRuntime(input)
-    : await runGeminiRuntime(input);
+  let result: RuntimeRunResult;
+  switch (runtime) {
+    case 'codex':       result = await runCodexRuntime(input); break;
+    case 'gemini':      result = await runGeminiRuntime(input); break;
+    case 'openai-sdk':  result = await runOpenAISdkRuntime(input); break;
+    case 'gemini-sdk':  result = await runGeminiSdkRuntime(input); break;
+  }
 
   return {
     text: result.text,

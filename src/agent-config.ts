@@ -33,7 +33,7 @@ export function agentExists(agentId: string): boolean {
   }
 }
 
-export type AgentRuntime = 'claude' | 'codex' | 'gemini';
+export type AgentRuntime = 'claude' | 'codex' | 'gemini' | 'openai-sdk' | 'gemini-sdk';
 
 export interface AgentConfig {
   name: string;
@@ -108,12 +108,13 @@ export function loadAgentConfig(agentId: string): AgentConfig {
   const description = (raw['description'] as string) ?? '';
   const botTokenEnv = raw['telegram_bot_token_env'] as string;
   const model = raw['model'] as string | undefined;
-  // Runtime field (claude|codex|gemini) — defaults to 'claude' for backward
-  // compat. Anything else is rejected so typos don't silently fall through.
+  // Runtime field — defaults to 'claude' for backward compat. Anything
+  // else is rejected so typos don't silently fall through.
   const rawRuntime = (raw['runtime'] as string | undefined)?.toLowerCase();
+  const VALID_RUNTIMES = new Set<AgentRuntime>(['claude', 'codex', 'gemini', 'openai-sdk', 'gemini-sdk']);
   const runtime: AgentRuntime | undefined =
-    rawRuntime === 'codex' || rawRuntime === 'gemini' || rawRuntime === 'claude'
-      ? rawRuntime
+    rawRuntime && VALID_RUNTIMES.has(rawRuntime as AgentRuntime)
+      ? (rawRuntime as AgentRuntime)
       : undefined;
   if (rawRuntime && !runtime) {
     // eslint-disable-next-line no-console
