@@ -2141,7 +2141,15 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    // Aceita todos os providers — Claude (SDK), OpenAI (Codex CLI/openai-sdk),
+    // Gemini (Gemini CLI/gemini-sdk). Validação só impede typos óbvios; não
+    // distingue qual model é válido pra qual provider — runtime branching
+    // em agent.ts decide via cfg.runtime se model é usado ou ignorado.
+    const validModels = [
+      'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5',
+      'gpt-5.5', 'gpt-5.2', 'gpt-4.1',
+      'gemini-2.5-pro', 'gemini-2.5-flash',
+    ];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model` }, 400);
 
     const agentIds = listAgentIds();
@@ -2166,7 +2174,15 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+    // Aceita todos os providers — Claude (SDK), OpenAI (Codex CLI/openai-sdk),
+    // Gemini (Gemini CLI/gemini-sdk). Validação só impede typos óbvios; não
+    // distingue qual model é válido pra qual provider — runtime branching
+    // em agent.ts decide via cfg.runtime se model é usado ou ignorado.
+    const validModels = [
+      'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5',
+      'gpt-5.5', 'gpt-5.2', 'gpt-4.1',
+      'gemini-2.5-pro', 'gemini-2.5-flash',
+    ];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model. Valid: ${validModels.join(', ')}` }, 400);
 
     try {

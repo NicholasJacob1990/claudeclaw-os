@@ -203,6 +203,8 @@ const WARROOM_ENABLED = warroomEnabled;
           <div class="model-opt" data-model="claude-opus-4-7" onclick="pickGlobalModel(this)">All Opus</div>
           <div class="model-opt" data-model="claude-sonnet-4-6" onclick="pickGlobalModel(this)">All Sonnet</div>
           <div class="model-opt" data-model="claude-haiku-4-5" onclick="pickGlobalModel(this)">All Haiku</div>
+          <div class="model-opt" data-model="gpt-5.5" onclick="pickGlobalModel(this)">All GPT-5.5</div>
+          <div class="model-opt" data-model="gemini-2.5-pro" onclick="pickGlobalModel(this)">All Gemini 2.5 Pro</div>
         </div>
       </div>
     </div>
@@ -1609,8 +1611,21 @@ async function loadAgents() {
       const color = AGENT_COLORS[a.id] || '#6b7280';
       const dot = a.running ? '<span style="color:#6ee7b7">\u25CF</span>' : '<span style="color:#666">\u25CB</span>';
       const statusText = a.running ? 'live' : 'off';
-      const modelOpts = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
-      const modelShort = function(m) { return {'claude-opus-4-7':'Opus','claude-sonnet-4-6':'Sonnet','claude-sonnet-4-5':'Sonnet 4.5','claude-haiku-4-5':'Haiku'}[m] || m; };
+      // Models por provider — Claude (SDK), OpenAI (Codex CLI / openai-sdk),
+      // Gemini (Gemini CLI / gemini-sdk). User pode mixar runtime + model
+      // independentemente; ramificação real acontece no agent.ts via runtime.
+      const modelOpts = [
+        'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5',
+        'gpt-5.5', 'gpt-5.2', 'gpt-4.1',
+        'gemini-2.5-pro', 'gemini-2.5-flash',
+      ];
+      const modelShort = function(m) {
+        return {
+          'claude-opus-4-7':'Opus','claude-sonnet-4-6':'Sonnet','claude-sonnet-4-5':'Sonnet 4.5','claude-haiku-4-5':'Haiku',
+          'gpt-5.5':'GPT-5.5','gpt-5.2':'GPT-5.2','gpt-4.1':'GPT-4.1',
+          'gemini-2.5-pro':'Gemini 2.5 Pro','gemini-2.5-flash':'Gemini 2.5 Flash',
+        }[m] || m;
+      };
       const currentModel = a.model || (a.id === 'main' ? 'claude-opus-4-7' : 'claude-sonnet-4-6');
       const modelLabel = modelShort(currentModel);
       const modelSelect = '<div class="model-picker" data-agent="' + a.id + '" onclick="event.stopPropagation();toggleModelPicker(this)">' +
