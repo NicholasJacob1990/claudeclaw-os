@@ -143,7 +143,7 @@ export async function runGeminiRuntime(input: RuntimeRunInput): Promise<RuntimeR
  * code_interpreter) that exist only in the Responses API. No subprocess
  * overhead. Skills from ~/.codex/ are NOT loaded (separate config domain).
  *
- * Default model: env OPENAI_DEFAULT_MODEL or 'gpt-4.1'. Hosted tools opt-in
+ * Default model: env OPENAI_DEFAULT_MODEL or 'gpt-5.5'. Hosted tools opt-in
  * via env OPENAI_HOSTED_TOOLS='web_search,file_search,code_interpreter'
  * (comma-separated, names match Responses API tool types).
  *
@@ -178,7 +178,7 @@ export async function runOpenAISdkRuntime(input: RuntimeRunInput): Promise<Runti
   if (enabledHostedTools.includes('file_search')) hostedTools.push({ type: 'file_search' });
   if (enabledHostedTools.includes('code_interpreter')) hostedTools.push({ type: 'code_interpreter', container: { type: 'auto' } });
 
-  const model = input.env.OPENAI_DEFAULT_MODEL || 'gpt-4.1';
+  const model = input.env.OPENAI_DEFAULT_MODEL || 'gpt-5.5';
   const { Agent, run } = agentsLib;
 
   try {
@@ -226,7 +226,7 @@ export async function runOpenAISdkRuntime(input: RuntimeRunInput): Promise<Runti
  * Gemini CLI path: gets GROUNDING (Google Search), code_execution sandbox,
  * Files API with vector store, thinking config. CLI doesn't expose these.
  *
- * Default model: env GEMINI_DEFAULT_MODEL or 'gemini-2.5-pro'. Grounding
+ * Default model: env GEMINI_DEFAULT_MODEL or 'gemini-3.1-pro-preview'. Grounding
  * opt-in via env GEMINI_USE_GROUNDING=true. code_execution opt-in via
  * GEMINI_USE_CODE_EXEC=true. Thinking budget via GEMINI_THINKING_BUDGET.
  */
@@ -255,7 +255,7 @@ export async function runGeminiSdkRuntime(input: RuntimeRunInput): Promise<Runti
   const thinkingBudgetRaw = input.env.GEMINI_THINKING_BUDGET;
   const thinkingBudget = thinkingBudgetRaw ? parseInt(thinkingBudgetRaw, 10) : undefined;
 
-  const model = input.env.GEMINI_DEFAULT_MODEL || 'gemini-2.5-pro';
+  const model = input.env.GEMINI_DEFAULT_MODEL || 'gemini-3.1-pro-preview';
   const { GoogleGenAI } = genAiLib;
 
   try {

@@ -2148,6 +2148,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const validModels = [
       'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5',
       'gpt-5.5', 'gpt-5.2', 'gpt-4.1',
+      'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
       'gemini-2.5-pro', 'gemini-2.5-flash',
     ];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model` }, 400);
@@ -2181,6 +2182,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const validModels = [
       'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5',
       'gpt-5.5', 'gpt-5.2', 'gpt-4.1',
+      'gemini-3.1-pro-preview', 'gemini-3-flash-preview',
       'gemini-2.5-pro', 'gemini-2.5-flash',
     ];
     if (!validModels.includes(model)) return c.json({ error: `Invalid model. Valid: ${validModels.join(', ')}` }, 400);
