@@ -118,24 +118,116 @@ import { getWaChats, getWaChatMessages, sendWhatsAppMessage, WaChat } from './wh
 // Per-chat voice mode toggle (in-memory, resets on restart)
 const voiceEnabledChats = new Set<string>();
 
-// Per-chat model override (in-memory, resets on restart)
-// When not set, uses CLI default (Opus via Max/OAuth)
+// Per-chat model + runtime override for `main`.
+//
+// `main` doesn't have an agent.yaml on disk — sub-agents do, so their
+// runtime/model is read at process start from yaml. For `main`, the only
+// way to pick gpt-*/gemini-* models is this in-memory override. To survive
+// restarts (launchd KeepAlive, npm rebuild, etc.), we also persist to a
+// json file and rehydrate at module init. Key is ALLOWED_CHAT_ID so two
+// different humans using the same install don't share overrides.
+//
+// Persistence file lives in /tmp because it's per-host runtime state, not
+// config — losing it on reboot is fine, the user can re-pick from the
+// dashboard. /tmp avoids polluting the repo or ~/.claudeclaw config dir.
+const MAIN_OVERRIDE_PATH = '/tmp/claudeclaw-main-override.json';
 const chatModelOverride = new Map<string, string>();
+const chatRuntimeOverride = new Map<string, 'claude' | 'codex' | 'gemini'>();
 
+function loadMainOverride(): void {
+  try {
+    const raw = fs.readFileSync(MAIN_OVERRIDE_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as { chatId?: string; model?: string; runtime?: string };
+    if (parsed.chatId && parsed.chatId === ALLOWED_CHAT_ID) {
+      if (parsed.model) chatModelOverride.set(parsed.chatId, parsed.model);
+      if (parsed.runtime === 'claude' || parsed.runtime === 'codex' || parsed.runtime === 'gemini') {
+        chatRuntimeOverride.set(parsed.chatId, parsed.runtime);
+      }
+      logger.info({ model: parsed.model, runtime: parsed.runtime }, 'Loaded persisted main override');
+    }
+  } catch { /* file missing or invalid — fall back to defaults */ }
+}
+
+function persistMainOverride(): void {
+  if (!ALLOWED_CHAT_ID) return;
+  try {
+    fs.writeFileSync(
+      MAIN_OVERRIDE_PATH,
+      JSON.stringify({
+        chatId: ALLOWED_CHAT_ID,
+        model: chatModelOverride.get(ALLOWED_CHAT_ID),
+        runtime: chatRuntimeOverride.get(ALLOWED_CHAT_ID),
+        savedAt: Date.now(),
+      }),
+      'utf-8',
+    );
+  } catch (err) {
+    logger.warn({ err }, 'Could not persist main override');
+  }
+}
+
+// Load any prior override at module init. Idempotent: if no file or
+// the chatId doesn't match, no-ops.
+loadMainOverride();
+
+// Alias → modelId. Telegram /model accepts any of these. Picking a non-Claude
+// alias auto-routes the runtime to the matching CLI (codex/gemini) via
+// inferRuntimeFromModel — user policy is CLI-only, never API SDKs.
 const AVAILABLE_MODELS: Record<string, string> = {
+  // Claude (SDK)
   opus: 'claude-opus-4-7',
   sonnet: 'claude-sonnet-4-6',
+  'sonnet-4-5': 'claude-sonnet-4-5',
   haiku: 'claude-haiku-4-5',
+  // OpenAI (codex CLI)
+  'gpt-5.5': 'gpt-5.5',
+  'gpt-5.2': 'gpt-5.2',
+  'gpt-4.1': 'gpt-4.1',
+  // Gemini (gemini CLI)
+  'gemini-3.1-pro': 'gemini-3.1-pro-preview',
+  'gemini-3-pro': 'gemini-3.1-pro-preview',
+  'gemini-3-flash': 'gemini-3-flash-preview',
+  'gemini-3.1-flash-lite': 'gemini-3.1-flash-lite-preview',
+  'gemini-3-flash-lite': 'gemini-3.1-flash-lite-preview',
+  'gemini-2.5-pro': 'gemini-2.5-pro',
+  'gemini-2.5-flash': 'gemini-2.5-flash',
 };
 const DEFAULT_MODEL_LABEL = 'sonnet';
 
+/** Infer the CLI runtime from a model id prefix. User locked the platform
+ *  to CLI-only (no OpenAI/Gemini API SDKs), so gpt-* always routes to the
+ *  codex CLI and gemini-* to the gemini CLI. Claude is the SDK. */
+function inferRuntimeFromModel(model: string): 'claude' | 'codex' | 'gemini' {
+  if (model.startsWith('gpt-')) return 'codex';
+  if (model.startsWith('gemini-')) return 'gemini';
+  return 'claude';
+}
+
 export function setMainModelOverride(model: string): void {
-  if (ALLOWED_CHAT_ID) chatModelOverride.set(ALLOWED_CHAT_ID, model);
+  if (!ALLOWED_CHAT_ID) return;
+  chatModelOverride.set(ALLOWED_CHAT_ID, model);
+  chatRuntimeOverride.set(ALLOWED_CHAT_ID, inferRuntimeFromModel(model));
+  persistMainOverride();
 }
 
 export function getMainModelOverride(): string | undefined {
   if (!ALLOWED_CHAT_ID) return undefined;
   return chatModelOverride.get(ALLOWED_CHAT_ID);
+}
+
+export function getMainRuntimeOverride(): 'claude' | 'codex' | 'gemini' | undefined {
+  if (!ALLOWED_CHAT_ID) return undefined;
+  return chatRuntimeOverride.get(ALLOWED_CHAT_ID);
+}
+
+/** Explicitly set the runtime for `main` without going through model
+ *  inference. Used by the dashboard PATCH /api/agents/main/runtime endpoint
+ *  for users who want to e.g. force codex CLI but pin the model in
+ *  ~/.codex/config.toml rather than via --model flag. */
+export function setMainRuntimeOverride(runtime: 'claude' | 'codex' | 'gemini'): void {
+  if (!ALLOWED_CHAT_ID) return;
+  chatRuntimeOverride.set(ALLOWED_CHAT_ID, runtime);
+  persistMainOverride();
 }
 
 // WhatsApp state per Telegram chat
@@ -1053,20 +1145,35 @@ export function createBot(): Bot {
       return;
     }
 
-    if (arg === 'reset' || arg === 'default' || arg === 'opus') {
+    if (arg === 'reset' || arg === 'default') {
       chatModelOverride.delete(chatIdStr);
+      chatRuntimeOverride.delete(chatIdStr);
+      // Wipe the persisted file too — without this, next process start
+      // would rehydrate the old override and ignore the reset.
+      try { fs.unlinkSync(MAIN_OVERRIDE_PATH); } catch { /* file might not exist */ }
       await ctx.reply(`Model reset to default (${DEFAULT_MODEL_LABEL})`);
       return;
     }
 
     const modelId = AVAILABLE_MODELS[arg];
     if (!modelId) {
-      await ctx.reply(`Unknown model: ${arg}\nAvailable: ${Object.keys(AVAILABLE_MODELS).join(', ')}`);
+      const list = Object.entries(AVAILABLE_MODELS)
+        .map(([alias, id]) => `  ${alias} → ${id}`)
+        .join('\n');
+      await ctx.reply(`Unknown model: ${arg}\n\nAvailable:\n${list}\n\nClaude → SDK | gpt-* → codex CLI | gemini-* → gemini CLI`);
       return;
     }
 
+    // setMainModelOverride does both: stores the model id AND infers the
+    // runtime (codex/gemini/claude) from the prefix. The dashboard reads
+    // both back via getMainModelOverride/getMainRuntimeOverride. Persist
+    // so the choice survives restart.
     chatModelOverride.set(chatIdStr, modelId);
-    await ctx.reply(`Model changed: ${arg} (${modelId})`);
+    chatRuntimeOverride.set(chatIdStr, inferRuntimeFromModel(modelId));
+    persistMainOverride();
+    const rt = inferRuntimeFromModel(modelId);
+    const rtLabel = rt === 'claude' ? 'Claude SDK' : rt === 'codex' ? 'codex CLI' : 'gemini CLI';
+    await ctx.reply(`Model changed: ${arg} (${modelId})\nRuntime: ${rtLabel}`);
   });
 
   // /memory — show recent memories for this chat
